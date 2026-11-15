@@ -446,24 +446,38 @@ class GenerationLimits:
     context_tokens: int = CONTEXT_TOKENS
 
 
-def _int_field(body: dict, name: str) -> int | None:
-    value = body.get(name)
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+def _count(value) -> int | None:
+    """A count or token limit as vLLM's request models would read it. Pydantic coerces "8", 8.0 and true to ints, so
+    those count too; fractions are rounded up, so nothing is counted lower than vLLM could use it."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return math.ceil(value)
+    return None
 
 
-def check_generation_budget(body: dict, limits: GenerationLimits) -> None:
+TOKEN_FIELDS = ("max_completion_tokens", "max_tokens", "max_output_tokens")
+
+
+def check_generation_budget(body: dict, limits: GenerationLimits, loc: tuple[str, ...] = ()) -> None:
     """Refuse a request that asks for more answers, or more output tokens in all, than the limits allow.
 
     The cost counted is prompts x answers per prompt x tokens per answer: completions take a list of prompts, batch
     chat a list of conversations, and n (or best_of, which is also the beam width for beam search) multiplies each.
-    An answer without max_tokens / max_completion_tokens / max_output_tokens counts as the full context. Fields of the
-    wrong type are left for vLLM to reject.
+    The tokens per answer are the largest of max_completion_tokens, max_tokens and max_output_tokens, whichever the
+    route reads, and the full context when none is set. Token-in requests carry these fields in sampling_params,
+    which is checked the same way.
     """
-    n = _int_field(body, "n") or 1
-    best_of = _int_field(body, "best_of") or 0
+    n = _count(body.get("n")) or 1
+    best_of = _count(body.get("best_of")) or 0
     width, width_field = (best_of, "best_of") if best_of > n else (n, "n")
     if limits.max_n is not None and width > limits.max_n:
-        raise RequestError([width_field], f"{width_field} is {width}; this server allows at most {limits.max_n}")
+        raise RequestError([*loc, width_field], f"{width_field} is {width}; this server allows at most {limits.max_n}")
     prompts = 1
     prompt = body.get("prompt")
     if isinstance(prompt, list) and prompt and not all(isinstance(token, int) for token in prompt):
@@ -471,21 +485,20 @@ def check_generation_budget(body: dict, limits: GenerationLimits) -> None:
     messages = body.get("messages")
     if isinstance(messages, list) and messages and all(isinstance(m, list) for m in messages):
         prompts = len(messages)  # /v1/chat/completions/batch: one answer per conversation
-    field, per_answer = next(
-        ((name, value) for name in ("max_completion_tokens", "max_tokens", "max_output_tokens")
-         if (value := _int_field(body, name)) is not None),
-        ("max_tokens", None),
-    )
-    unset = per_answer is None or per_answer < 1
+    given = [(value, name) for name in TOKEN_FIELDS if (value := _count(body.get(name))) is not None and value >= 1]
+    per_answer, field = max(given) if given else (None, "max_tokens")
+    unset = per_answer is None
     per_answer = limits.context_tokens if unset else min(per_answer, limits.context_tokens)
     total = prompts * width * per_answer
     if limits.max_tokens is not None and total > limits.max_tokens:
         unit = f"{per_answer} tokens each" + (f" ({field} not set)" if unset else "")
         raise RequestError(
-            [field],
+            [*loc, field],
             f"this request asks for up to {total} output tokens ({prompts} prompt(s) x {width} answer(s) x {unit}); "
             f"this server allows at most {limits.max_tokens} per request. Set {field} or ask for fewer answers",
         )
+    if not loc and isinstance(body.get("sampling_params"), dict):
+        check_generation_budget(body["sampling_params"], limits, ("sampling_params",))
 
 
 def public_request_body(

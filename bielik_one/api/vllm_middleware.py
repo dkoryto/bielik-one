@@ -658,7 +658,11 @@ class SystemOneMiddleware:
             return
         try:
             # A request without a model keeps none: vLLM answers it with its default served name, as without us.
-            limits = GenerationLimits(self.settings.max_generation_n, self.settings.max_generation_tokens)
+            limits = GenerationLimits(
+                self.settings.max_generation_n,
+                self.settings.max_generation_tokens,
+                getattr(self.engine, "max_model_len", 32768),
+            )
             body = public_request_body(_scrub_sampling_params(raw), {self.settings.lora_name}, None, limits)
         except RequestError as exc:
             return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, exc.msg, fmt="openai"))

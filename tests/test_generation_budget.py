@@ -36,7 +36,7 @@ def refused(body, limits=LIMITS):
         {"messages": [{"role": "user", "content": "hi"}]},  # one answer, up to the full context
         {"messages": [], "n": 4},  # four full-context answers: exactly the budget
         {"messages": [], "n": 16, "max_tokens": 8192},
-        {"messages": [], "n": 16, "max_completion_tokens": 8192, "max_tokens": 10**9},  # chat prefers this field
+        {"messages": [], "n": 16, "max_completion_tokens": 8192},
         {"prompt": ["a"] * 1024, "max_tokens": 128},  # 1024 prompts x 128 tokens
         {"prompt": list(range(5000)), "n": 4},  # one prompt given as token ids, not 5000 prompts
         {"messages": [[{"role": "user", "content": "a"}]] * 8, "max_tokens": 16384},  # batch chat
@@ -83,9 +83,38 @@ def test_unset_max_tokens_is_named_in_the_message():
     assert "(max_tokens not set)" in refused({"messages": [], "n": 8}).msg
 
 
-def test_fields_of_the_wrong_type_are_left_to_vllm():
-    for body in ({"messages": [], "n": "1000"}, {"messages": [], "n": True, "max_tokens": "x"}, {"n": None}):
+@pytest.mark.parametrize("n", ["1000", " 1000 ", 1000.0, "1e3", 16.5])
+def test_counts_are_read_the_way_vllm_coerces_them(n):
+    # vLLM's pydantic models accept "1000" and 1000.0 as n=1000; a fraction is rounded up, never down.
+    assert refused({"messages": [], "n": n, "max_tokens": 1}).loc == ["body", "n"]
+
+
+@pytest.mark.parametrize("max_tokens", ["32768", 32768.0])
+def test_token_limits_are_read_the_way_vllm_coerces_them(max_tokens):
+    assert refused({"messages": [], "n": 5, "max_tokens": max_tokens}).loc == ["body", "max_tokens"]
+
+
+def test_values_vllm_would_reject_anyway_are_not_counted():
+    for body in ({"messages": [], "n": "many"}, {"messages": [], "n": None}, {"messages": [], "max_tokens": [5]},
+                 {"messages": [], "n": float("nan")}, {"messages": [], "n": True}):
         check_generation_budget(body, LIMITS)
+
+
+def test_the_largest_token_field_counts():
+    # /v1/completions reads max_tokens; a small max_completion_tokens next to it must not hide it.
+    body = {"prompt": "x", "n": 8, "max_completion_tokens": 1, "max_tokens": 32_768}
+    error = refused(body)
+    assert error.loc == ["body", "max_tokens"] and "up to 262144 output tokens" in error.msg
+    assert refused({"messages": [], "n": 8, "max_tokens": 1, "max_output_tokens": 30_000}).loc == ["body", "max_output_tokens"]
+    # The filter does not know which field the route will read, so contradictory limits count at the larger one.
+    assert refused({"messages": [], "n": 16, "max_completion_tokens": 8192, "max_tokens": 10**9}).loc == ["body", "max_tokens"]
+
+
+def test_token_in_sampling_params_are_checked():
+    check_generation_budget({"token_ids": [1, 2], "sampling_params": {"n": 2, "max_tokens": 64}}, LIMITS)
+    assert refused({"token_ids": [1], "sampling_params": {"n": 1000}}).loc == ["body", "sampling_params", "n"]
+    error = refused({"token_ids": [1], "sampling_params": {"n": 8, "max_tokens": "32768"}})
+    assert error.loc == ["body", "sampling_params", "max_tokens"]
 
 
 def test_limits_can_be_lifted():
@@ -149,8 +178,14 @@ def test_middleware_refuses_over_budget_requests_on_every_public_route():
             response = client.post(path, json={"model": "base-a", "messages": [], "n": 1000})
             assert response.status_code == 400, path
             assert "n is 1000" in response.json()["error"]["message"]
+            assert client.post(path, json={"model": "base-a", "messages": [], "n": "1000"}).status_code == 400, path
             ok = client.post(path, json={"model": "base-a", "messages": [], "n": 2, "max_tokens": 64})
             assert ok.status_code == 200, path
+        # Token-in requests carry n and max_tokens in sampling_params.
+        token_in = {"model": "base-a", "token_ids": [1, 2], "sampling_params": {"n": 1000, "max_tokens": 1}}
+        assert client.post("/inference/v1/generate", json=token_in).status_code == 400
+        token_in["sampling_params"]["n"] = 2
+        assert client.post("/inference/v1/generate", json=token_in).status_code == 200
 
 
 def test_middleware_settings_and_internal_reads():
