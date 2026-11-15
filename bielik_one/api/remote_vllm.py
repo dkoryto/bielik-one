@@ -475,10 +475,38 @@ ROUTE_READINGS = {
 ANY_READING = (_CHAT, ("max_tokens",), ("max_output_tokens",))
 
 
+# vLLM routes that never generate output tokens (tokenization, rendering, scoring with max_tokens=1, embeddings,
+# pooling, reranking, status and admin calls): the budget does not apply to them.
+NON_GENERATION_ROUTES = (
+    "/tokenize", "/detokenize", "/v1/messages/count_tokens", "/generative_scoring",
+    "/v1/chat/completions/render", "/v1/chat/completions/derender", "/v1/completions/render",
+    "/v1/completions/derender", "/v1/messages/render", "/v1/responses/render",
+    "/v1/embeddings", "/v2/embed", "/pooling", "/classify", "/score", "/v1/score", "/rerank", "/v1/rerank", "/v2/rerank",
+    "/ping", "/is_scaling_elastic_ep",
+)
+# On a route the filter knows nothing about, a body that asks for none of these is not a generation request.
+GENERATION_FIELDS = ("prompt", "messages", "input", "token_ids", "sampling_params", "n", "best_of", *(
+    "max_completion_tokens", "max_tokens", "max_output_tokens"))
+
+
+def _on(route: str, path: str) -> bool:
+    """route is path, possibly behind a root path."""
+    return route == path or route.endswith(path) and route[: -len(path)].startswith("/")
+
+
+def generates(route: str | None, body: dict) -> bool:
+    """Whether the generation budget applies to this request."""
+    if route and any(_on(route, path) for path in NON_GENERATION_ROUTES):
+        return False
+    if route and any(_on(route, path) for path in ROUTE_READINGS) or route and _on(route, "/inference/v1/generate"):
+        return True
+    return any(field in body for field in GENERATION_FIELDS)
+
+
 def _readings(route: str | None) -> tuple[tuple[str, ...], ...]:
     if route:
         for path, readings in ROUTE_READINGS.items():
-            if route == path or route.endswith(path) and route[: -len(path)].startswith("/"):  # behind a root path
+            if _on(route, path):
                 return readings
     return ANY_READING
 
@@ -567,7 +595,8 @@ def public_request_body(
         raise RequestError(
             ["prompt_logprobs"], "prompt logprobs are not supported by this server"
         )
-    check_generation_budget(body, limits, route)
+    if generates(route, body):
+        check_generation_budget(body, limits, route)
     if "vllm_xargs" in body:
         body.pop("vllm_xargs")
         changed = True

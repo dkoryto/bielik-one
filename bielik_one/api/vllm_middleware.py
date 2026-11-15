@@ -44,6 +44,7 @@ Environment:
 - SYSTEMONE_MAX_GENERATION_N: largest n (or best_of) a public generation request may ask for (default 16; "none"
   lifts it). SYSTEMONE_MAX_GENERATION_TOKENS: output tokens one public request may ask for in all, prompts x n x
   max_tokens with an unset max_tokens counting as the full context (default 131072). As `bielik-one frontend`.
+  Routes that do not generate (tokenize, render, count_tokens, scoring, embeddings, rerank) are not counted.
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
   --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API
   process, so a shared value is required then (the server refuses to start without it).

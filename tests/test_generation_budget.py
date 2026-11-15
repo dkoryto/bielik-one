@@ -157,6 +157,45 @@ def test_public_request_body_applies_the_budget_and_keeps_valid_bodies_as_sent()
     assert public_request_body(body, {"decision"}, "chat", lifted) is body
 
 
+TIGHT = GenerationLimits(max_n=2, max_tokens=4096, context_tokens=32_768)
+
+
+@pytest.mark.parametrize(
+    "route, body",
+    [
+        ("/tokenize", {"model": "chat", "prompt": "hello"}),
+        ("/tokenize", {"model": "chat", "messages": [{"role": "user", "content": "hi"}]}),
+        ("/detokenize", {"model": "chat", "tokens": [1, 2, 3]}),
+        ("/v1/messages/count_tokens", {"model": "chat", "messages": [{"role": "user", "content": "hi"}]}),
+        ("/v1/chat/completions/render", {"model": "chat", "messages": []}),
+        ("/v1/completions/render", {"model": "chat", "prompt": "hello"}),
+        ("/generative_scoring", {"model": "chat", "query": "q", "items": ["a", "b"]}),
+        ("/v1/embeddings", {"model": "chat", "input": "hello"}),
+        ("/api/tokenize", {"model": "chat", "prompt": "hello"}),  # behind a root path
+        ("/pause", {}),  # an admin call with no generation fields
+    ],
+)
+def test_routes_that_do_not_generate_are_not_charged(route, body):
+    # A budget below the context would refuse each of these if they were counted as full-context answers.
+    raw = json.dumps(body).encode()
+    assert public_request_body(raw, {"decision"}, None, TIGHT, route) is raw
+
+
+@pytest.mark.parametrize(
+    "route, body",
+    [
+        (CHAT, {"model": "chat", "messages": []}),  # one full-context answer is over 4096
+        (COMPLETIONS, {"model": "chat", "prompt": "hello", "max_tokens": 5000}),
+        ("/invocations", {"model": "chat", "prompt": "hello"}),  # unknown route, generation body
+        ("/inference/v1/generate", {"model": "chat", "token_ids": [1], "sampling_params": {"max_tokens": 5000}}),
+        ("/v1/chat/completions/batch", {"model": "chat", "messages": [[{"role": "user", "content": "a"}]] * 3}),
+    ],
+)
+def test_routes_that_generate_are_still_charged(route, body):
+    with pytest.raises(RequestError):
+        public_request_body(json.dumps(body).encode(), {"decision"}, None, TIGHT, route)
+
+
 # -- separate frontend ----------------------------------------------------------------------------------------------
 
 
