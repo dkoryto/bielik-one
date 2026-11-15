@@ -177,6 +177,9 @@ def verify(root: Path) -> dict:
     kind = detect(root)
     adapter_kind = kind.endswith("adapter")
     heads = json.loads((root / "heads.json").read_text()) if adapter_kind and "heads.json" in listed else None
+    if adapter_kind and "heads.json" in listed and not isinstance(heads, dict):
+        # null or a list would skip the weights_file and digest checks below
+        raise ValueError("heads.json must be a JSON object")
     missing = sorted(_required_files(root, kind, heads) - set(listed))
     if missing:
         raise ValueError(f"Required files not listed in SHA256SUMS.json for a {kind} package: {', '.join(missing)}")

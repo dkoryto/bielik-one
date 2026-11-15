@@ -354,6 +354,18 @@ class ManifestCompletenessTests(unittest.TestCase):
                 resign(root, "model.safetensors.index.json")
                 self.refused(d, pattern)
 
+    def test_heads_that_is_not_an_object_is_refused(self):
+        for kind in ("llama-adapter", "qwen-adapter"):
+            for content in ("null", "[]", '"heads"', "5"):
+                with self.subTest(kind=kind, content=content), tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    package(kind, root)
+                    (root / "heads.json").write_text(content)
+                    resign(root, "heads.json")
+                    (root / "heads.safetensors").unlink()  # with heads.json null, nothing would ask for it
+                    edit_manifest(root, drop=["heads.safetensors"])
+                    self.refused(d, "heads.json must be a JSON object")
+
     def test_heads_without_weights_file_is_refused(self):
         for kind in ("llama-adapter", "qwen-adapter"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
