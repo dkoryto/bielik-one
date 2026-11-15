@@ -134,6 +134,24 @@ class TokenLimitTests(unittest.TestCase):
             e.evaluate(body(questions=8, permutations=16))
         self.assertEqual(len(tokenized), 3)
 
+    def test_prompt_counts_once_per_backend_chunk(self):
+        # 200 options do not fit one read (127 output ids per request), so _read() sends the prompt twice.
+        for kind in ("labels", "choice"):
+            with self.subTest(kind=kind):
+                question = {"type": kind, "instructions": "?", "criteria": {f"o{j}": "t" for j in range(200)}}
+                request = SystemOneIn(model="decision", state="x", read_twice=False, questions={"q": question})
+                backend = Backend()
+                e = engine(backend, max_request_tokens=2 * 50 - 1)
+                self.addCleanup(e.close)
+                with prompts(50), self.assertRaises(RequestError):
+                    e.evaluate(request)
+                self.assertEqual(backend.calls, 0)
+                e = engine(backend, max_request_tokens=2 * 50)
+                self.addCleanup(e.close)
+                with prompts(50):
+                    e.evaluate(request)
+                self.assertEqual(backend.calls, 2)  # the two chunks the cap accounted for
+
     def test_limit_can_be_lifted(self):
         backend = Backend()
         e = engine(backend, max_request_tokens=None)
@@ -180,7 +198,53 @@ class QueuedReadsTests(unittest.TestCase):
         self.assertLessEqual(backend.calls, 3)
 
 
+    def test_a_later_failure_is_seen_while_an_earlier_read_is_still_running(self):
+        release = threading.Event()
+
+        def handle(number, request):
+            if number == 1:
+                release.wait(5)  # the first read hangs
+                return answer(request)
+            if number == 2:
+                return httpx.Response(500)  # the second one fails at once
+            return answer(request)
+
+        backend = Backend(handle)
+        e = engine(backend, workers=2)
+        self.addCleanup(e.close)
+        started = time.monotonic()
+        try:
+            with prompts(50), self.assertRaises(BackendReadError):
+                e.evaluate(body(questions=8, permutations=16))
+            failed_after = time.monotonic() - started
+        finally:
+            release.set()
+        time.sleep(0.3)
+        self.assertLess(failed_after, 1.0)  # not after the hanging first read
+        # The hanging read, the failed one, and at most one taken by the freed worker before cancellation.
+        self.assertLessEqual(backend.calls, 3)
+
+
 class DeadlineTests(unittest.TestCase):
+    def test_nothing_is_sent_when_building_the_prompts_used_up_the_deadline(self):
+        backend = Backend()
+        e = engine(backend, request_timeout=0.2)
+        self.addCleanup(e.close)
+
+        def slow_prompt(*args, **kwargs):
+            time.sleep(0.05)
+            return [7] * 50
+
+        letters = lambda tok, row, semantic: list(range(1000, 1000 + len(row.options)))
+        with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=slow_prompt), patch(
+            "bielik_one.api.remote_vllm.answer_token_ids", side_effect=letters
+        ), patch("bielik_one.api.server.answer_token_ids", side_effect=letters), self.assertRaises(
+            BackendReadError
+        ) as caught:
+            e.evaluate(body(questions=2, permutations=4))  # 8 prompts x 0.05 s > 0.2 s
+        self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+        self.assertEqual(backend.calls, 0)
+
     def slow(self, delay):
         def handle(number, request):
             time.sleep(delay)

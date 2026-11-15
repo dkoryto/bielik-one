@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 import contextvars
 import json
@@ -333,6 +333,7 @@ class RemoteVllmEngine(LetterEngine):
         if first_rows and len(first_rows) != len(orders):
             raise ValueError("Expected one original row per decision read")
         started = time.monotonic()
+        deadline = None if self.request_timeout is None else started + self.request_timeout
         standard = []
         standard_tokens = 0
         groups = {}
@@ -351,8 +352,10 @@ class RemoteVllmEngine(LetterEngine):
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
                 )
-            # Checked while the prompts are built, so an oversized request stops before it holds them all.
-            standard_tokens += len(ids)
+            # Checked while the prompts are built, so an oversized request stops before it holds them all. _read()
+            # sends the prompt once per chunk of output ids, so questions with more options than a chunk count more.
+            width = self._chunk_width(row.question.type in self.base_row_types)
+            standard_tokens += len(ids) * -(-len(row.options) // width)
             if self.max_request_tokens is not None and standard_tokens > self.max_request_tokens:
                 raise RequestError(
                     ["questions"],
@@ -403,23 +406,29 @@ class RemoteVllmEngine(LetterEngine):
                 if kind == "labels" else answer_token_ids(self.tok, row, self.semantic)
             )
             tasks.append((ids, list(outputs), kind))
+        timeout_message = f"vLLM did not finish the decision reads within {self.request_timeout:g} s"
+        if deadline is not None and time.monotonic() >= deadline:
+            # Building the prompts used up the budget: send nothing.
+            raise BackendReadError(timeout_message) from TimeoutError()
         # Each read runs in a copy of the request's context, so it sees the request id.
         futures = [
             self.pool.submit(contextvars.copy_context().run, self._read, *task)
             for task in tasks
         ]
-        deadline = None if self.request_timeout is None else started + self.request_timeout
         try:
-            results = [
-                future.result(
-                    timeout=None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-                for future in futures
-            ]
-        except TimeoutError as exc:
-            raise BackendReadError(
-                f"vLLM did not finish the decision reads within {self.request_timeout:g} s"
-            ) from exc
+            # Return on the first failure, whichever read it is, instead of waiting for earlier reads in order:
+            # meanwhile the pool's other workers would keep sending this request's queued reads.
+            done, pending = wait(
+                futures,
+                timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+                return_when=FIRST_EXCEPTION,
+            )
+            for future in futures:
+                if future in done and not future.cancelled() and future.exception() is not None:
+                    raise future.exception()
+            if pending:
+                raise BackendReadError(timeout_message) from TimeoutError()
+            results = [future.result() for future in futures]
         finally:
             # The pool outlives the request: once the answer is known (or has failed), reads still queued for it
             # would only load the backend. Reads already running finish on their own; finished ones are unaffected.
