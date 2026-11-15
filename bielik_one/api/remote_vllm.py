@@ -36,6 +36,10 @@ from bielik_one.prompting.letter import answer_token_ids
 # vLLM 0.32 caps logprob_token_ids at 128 per request (vllm.sampling_params.MAX_LOGPROB_TOKEN_IDS).
 MAX_LOGPROB_TOKEN_IDS = 128
 
+# /health, /ping and /v1/models ask vLLM something it answers at once. A backend that accepts the connection but does
+# not answer must fail the probe in seconds, not after the hour the chat proxy allows for a long generation.
+PROBE_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+
 # Request-local collection: concurrent requests must never share inference metadata.
 _prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
 
@@ -519,7 +523,7 @@ def build_remote_app(
     @app.get("/ping")
     async def health():
         try:
-            response = await proxy.get(engine.backend_url + "/health")
+            response = await proxy.get(engine.backend_url + "/health", timeout=PROBE_TIMEOUT)
             response.raise_for_status()
         except httpx.HTTPError:
             return JSONResponse(
@@ -541,7 +545,9 @@ def build_remote_app(
     @app.get("/v1/models")
     async def models(request: Request):
         try:
-            response = await proxy.get(engine.backend_url + "/v1/models")
+            response = await proxy.get(engine.backend_url + "/v1/models", timeout=PROBE_TIMEOUT)
+        except httpx.TimeoutException:
+            return failure(request, 504, TIMEOUT, "vLLM did not answer in time")
         except httpx.HTTPError:
             return failure(request, 502, BACKEND_UNAVAILABLE, "vLLM unavailable")
         content = response.content
