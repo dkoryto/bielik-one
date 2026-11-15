@@ -152,6 +152,28 @@ class TokenLimitTests(unittest.TestCase):
                     e.evaluate(request)
                 self.assertEqual(backend.calls, 2)  # the two chunks the cap accounted for
 
+    def test_read_twice_counts_and_falls_back_question_by_question(self):
+        # Standard prompts are 50 tokens and repeated ones 90. Three questions fit the limit only if one of them
+        # keeps the standard prompt: 90 + 90 + 50 = 230.
+        def tokenize(tok, row, semantic, **kwargs):
+            return [7] * (90 if kwargs.get("read_twice") else 50)
+
+        letters = lambda tok, row, semantic: list(range(1000, 1000 + len(row.options)))
+        backend = Backend()
+        e = engine(backend, max_request_tokens=230)
+        self.addCleanup(e.close)
+        request = SystemOneIn(
+            model="decision", state="x", read_twice=True,
+            questions={f"q{i}": {"type": "noul", "instructions": "?"} for i in range(3)},
+        )
+        with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=tokenize), patch(
+            "bielik_one.api.remote_vllm.answer_token_ids", side_effect=letters
+        ), patch("bielik_one.api.server.answer_token_ids", side_effect=letters):
+            result = e.evaluate(request)
+        reasons = [result["answers"][f"q{i}"]["prompt"]["reason"] for i in range(3)]
+        self.assertEqual(reasons, ["applied", "applied", "request_token_limit"])
+        self.assertEqual(result["usage"]["input_tokens"], 90 + 90 + 50)  # exactly what was sent
+
     def test_limit_can_be_lifted(self):
         backend = Backend()
         e = engine(backend, max_request_tokens=None)
@@ -202,11 +224,9 @@ class QueuedReadsTests(unittest.TestCase):
         release = threading.Event()
 
         def handle(number, request):
-            if number == 1:
-                release.wait(5)  # the first read hangs
-                return answer(request)
             if number == 2:
-                return httpx.Response(500)  # the second one fails at once
+                return httpx.Response(500)  # the second read fails at once
+            release.wait(5)  # every other read hangs until the request has given up
             return answer(request)
 
         backend = Backend(handle)
@@ -221,11 +241,20 @@ class QueuedReadsTests(unittest.TestCase):
             release.set()
         time.sleep(0.3)
         self.assertLess(failed_after, 1.0)  # not after the hanging first read
-        # The hanging read, the failed one, and at most one taken by the freed worker before cancellation.
+        # The hanging first read, the failed one, and at most one taken by the freed worker before cancellation:
+        # that one hangs too, so no worker is free to take more.
         self.assertLessEqual(backend.calls, 3)
 
 
 class DeadlineTests(unittest.TestCase):
+    def test_no_deadline_is_a_valid_configuration(self):
+        backend = Backend()
+        e = engine(backend, request_timeout=None)
+        self.addCleanup(e.close)
+        with prompts(50):
+            self.assertEqual(len(e.evaluate(body(questions=2, permutations=4))["answers"]), 2)
+        self.assertEqual(backend.calls, 8)
+
     def test_nothing_is_sent_when_building_the_prompts_used_up_the_deadline(self):
         backend = Backend()
         e = engine(backend, request_timeout=0.2)

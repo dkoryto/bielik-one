@@ -41,8 +41,8 @@ Environment:
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
 - SYSTEMONE_MAX_BODY_MB: largest decision or public request body (default 16); form uploads are not limited here.
-- SYSTEMONE_MAX_REQUEST_TOKENS: prompt tokens one decision request may send in all, counted on the standard prompts
-  (default 4194304); larger requests get 422, as with `bielik-one frontend --max-request-tokens`.
+- SYSTEMONE_MAX_REQUEST_TOKENS: prompt tokens the decision reads of one request may send in all (default 4194304), as
+  with `bielik-one frontend --max-request-tokens`.
 - SYSTEMONE_REQUEST_TIMEOUT: seconds one decision request may spend on its reads (default 600); slower ones get 504.
 - SYSTEMONE_INTERNAL_TOKEN: the secret of the loopback reads (default: random per process). With
   --api-server-count > 1 (vLLM's default with --data-parallel-size > 1) a loopback read can reach another API

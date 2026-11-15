@@ -37,8 +37,8 @@ from bielik_one.prompting.letter import answer_token_ids
 # vLLM 0.32 caps logprob_token_ids at 128 per request (vllm.sampling_params.MAX_LOGPROB_TOKEN_IDS).
 MAX_LOGPROB_TOKEN_IDS = 128
 
-# Prompt tokens one request may send in all, counted on the standard prompts (read twice can at most double what is
-# sent). 64 questions over a 32k-token state is about 2.1M; the cap leaves room for two option orders of that.
+# Prompt tokens the decision reads of one request may send in all. 64 questions over a 32k-token state is about 2.1M;
+# the cap leaves room for two option orders of that.
 DEFAULT_MAX_REQUEST_TOKENS = 4_194_304
 # Wall-clock budget for one request's decision reads, from tokenization to the last read.
 DEFAULT_REQUEST_TIMEOUT = 600.0
@@ -335,7 +335,8 @@ class RemoteVllmEngine(LetterEngine):
         started = time.monotonic()
         deadline = None if self.request_timeout is None else started + self.request_timeout
         standard = []
-        standard_tokens = 0
+        chunks = []  # backend reads per prompt: _read() sends the prompt once per chunk of output ids
+        sent_tokens = 0
         groups = {}
         for index, row in enumerate(orders):
             if row.question.type == "labels" and len(row.options) > self.labels_capacity:
@@ -352,11 +353,12 @@ class RemoteVllmEngine(LetterEngine):
                 raise RequestError(
                     ["questions", row.id], "context limit exceeded; no truncation"
                 )
-            # Checked while the prompts are built, so an oversized request stops before it holds them all. _read()
-            # sends the prompt once per chunk of output ids, so questions with more options than a chunk count more.
+            # Checked while the prompts are built, so an oversized request stops before it holds them all. Questions
+            # with more options than one read can carry count once per read.
             width = self._chunk_width(row.question.type in self.base_row_types)
-            standard_tokens += len(ids) * -(-len(row.options) // width)
-            if self.max_request_tokens is not None and standard_tokens > self.max_request_tokens:
+            chunks.append(-(-len(row.options) // width))
+            sent_tokens += len(ids) * chunks[-1]
+            if self.max_request_tokens is not None and sent_tokens > self.max_request_tokens:
                 raise RequestError(
                     ["questions"],
                     f"the decision reads of this request need more than {self.max_request_tokens} prompt tokens "
@@ -381,12 +383,17 @@ class RemoteVllmEngine(LetterEngine):
                         questions=questions, questions_before_state=questions_before_state,
                         read_twice=True, analysis=(analyses or {}).get(name, ""),
                     ) for i in indices]
-                    if all(len(ids) + 1 <= self.max_model_len for ids in repeated):
+                    extra = sum((len(ids) - len(standard[i])) * chunks[i] for i, ids in zip(indices, repeated))
+                    if not all(len(ids) + 1 <= self.max_model_len for ids in repeated):
+                        reason = "context_limit"
+                    elif self.max_request_tokens is not None and sent_tokens + extra > self.max_request_tokens:
+                        # The limit counts what is sent: this question keeps the standard prompt instead.
+                        reason = "request_token_limit"
+                    else:
                         reason = "applied"
+                        sent_tokens += extra
                         for i, ids in zip(indices, repeated, strict=True):
                             selected[i] = ids
-                    else:
-                        reason = "context_limit"
             decisions[name] = reason
 
         tasks = []
@@ -406,10 +413,12 @@ class RemoteVllmEngine(LetterEngine):
                 if kind == "labels" else answer_token_ids(self.tok, row, self.semantic)
             )
             tasks.append((ids, list(outputs), kind))
-        timeout_message = f"vLLM did not finish the decision reads within {self.request_timeout:g} s"
+        def timed_out() -> BackendReadError:  # only with a deadline: request_timeout may be None
+            return BackendReadError(f"vLLM did not finish the decision reads within {self.request_timeout:g} s")
+
         if deadline is not None and time.monotonic() >= deadline:
             # Building the prompts used up the budget: send nothing.
-            raise BackendReadError(timeout_message) from TimeoutError()
+            raise timed_out() from TimeoutError()
         # Each read runs in a copy of the request's context, so it sees the request id.
         futures = [
             self.pool.submit(contextvars.copy_context().run, self._read, *task)
@@ -427,7 +436,7 @@ class RemoteVllmEngine(LetterEngine):
                 if future in done and not future.cancelled() and future.exception() is not None:
                     raise future.exception()
             if pending:
-                raise BackendReadError(timeout_message) from TimeoutError()
+                raise timed_out() from TimeoutError()
             results = [future.result() for future in futures]
         finally:
             # The pool outlives the request: once the answer is known (or has failed), reads still queued for it
@@ -703,8 +712,9 @@ def add_limit_arguments(parser):
         "--max-request-tokens",
         type=_positive_int,
         default=DEFAULT_MAX_REQUEST_TOKENS,
-        help="prompt tokens one /v1/systemone request may send in all, counted on the standard prompts; "
-        f"larger requests get HTTP 422 (default: {DEFAULT_MAX_REQUEST_TOKENS})",
+        help="prompt tokens the decision reads of one /v1/systemone request may send in all; a request over it with "
+        "standard prompts gets HTTP 422, and read twice is skipped for questions that would push it over "
+        f"(default: {DEFAULT_MAX_REQUEST_TOKENS})",
     )
     parser.add_argument(
         "--request-timeout",
