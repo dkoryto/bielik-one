@@ -403,6 +403,52 @@ class ManifestCompletenessTests(unittest.TestCase):
                 (Path(d) / name).write_text("{}")
                 self.refused(d, f"Not listed in SHA256SUMS.json: {name}")
 
+    def test_dot_prefixed_names_are_the_same_files(self):
+        for kind in ("llama-adapter", "qwen-adapter", "llama-merged"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                package(kind, root)
+                sums = json.loads((root / "SHA256SUMS.json").read_text())
+                if kind.endswith("adapter"):
+                    heads = json.loads((root / "heads.json").read_text())
+                    heads.update(weights_file="./heads.safetensors", weights_sha256=sums["heads.safetensors"])
+                    (root / "heads.json").write_text(json.dumps(heads))
+                    sums["heads.json"] = hashlib.sha256((root / "heads.json").read_bytes()).hexdigest()
+                (root / "SHA256SUMS.json").write_text(json.dumps({f"./{name}": value for name, value in sums.items()}))
+                for component in ("backend", "frontend"):
+                    self.assertEqual(dry(component, d)["kind"], kind)
+
+    def test_a_file_listed_twice_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            package("llama-merged", root)
+            sums = json.loads((root / "SHA256SUMS.json").read_text())
+            edit_manifest(root, **{"./config__json": sums["config.json"]})
+            self.refused(d, "config.json is listed more than once")
+
+    def test_auxiliary_files_cannot_stand_in_for_weights(self):
+        # README.md and LICENSE are exempt from hashing, so naming one as weights would skip the check.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            package("llama-merged", root)
+            (root / "README.md").write_text("docs")
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"a": "model-00001.safetensors", "b": "README.md"}})
+            )
+            resign(root, "model.safetensors.index.json")
+            edit_manifest(root, README__md="0" * 64)
+            self.refused(d, "model.safetensors.index.json names README.md as a weights file")
+        for kind in ("llama-adapter", "qwen-adapter"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                package(kind, root)
+                heads = json.loads((root / "heads.json").read_text())
+                heads.update(weights_file="LICENSE", weights_sha256="0" * 64)
+                (root / "heads.json").write_text(json.dumps(heads))
+                resign(root, "heads.json")
+                edit_manifest(root, LICENSE="0" * 64)
+                self.refused(d, "heads.json names LICENSE as a weights file")
+
     def test_middleware_package_check_uses_the_same_rules(self):
         with tempfile.TemporaryDirectory() as d:
             package("qwen-adapter", Path(d))
