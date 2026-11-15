@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -39,6 +40,9 @@ MAX_LOGPROB_TOKEN_IDS = 128
 # /health, /ping and /v1/models ask vLLM something it answers at once. A backend that accepts the connection but does
 # not answer must fail the probe in seconds, not after the hour the chat proxy allows for a long generation.
 PROBE_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+# httpx limits each read, not the whole answer: a backend that sends a fragment every few seconds would never trip
+# PROBE_TIMEOUT. This bounds the whole probe.
+PROBE_DEADLINE = 5.0
 
 # Request-local collection: concurrent requests must never share inference metadata.
 _prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
@@ -519,13 +523,17 @@ def build_remote_app(
     )
     failure = install_backend_errors(app, error_format)
 
+    async def probe(path: str) -> httpx.Response:
+        async with asyncio.timeout(PROBE_DEADLINE):
+            return await proxy.get(engine.backend_url + path, timeout=PROBE_TIMEOUT)
+
     @app.get("/health")
     @app.get("/ping")
     async def health():
         try:
-            response = await proxy.get(engine.backend_url + "/health", timeout=PROBE_TIMEOUT)
+            response = await probe("/health")
             response.raise_for_status()
-        except httpx.HTTPError:
+        except (httpx.HTTPError, TimeoutError):
             return JSONResponse(
                 status_code=503,
                 content={
@@ -545,8 +553,8 @@ def build_remote_app(
     @app.get("/v1/models")
     async def models(request: Request):
         try:
-            response = await proxy.get(engine.backend_url + "/v1/models", timeout=PROBE_TIMEOUT)
-        except httpx.TimeoutException:
+            response = await probe("/v1/models")
+        except (httpx.TimeoutException, TimeoutError):
             return failure(request, 504, TIMEOUT, "vLLM did not answer in time")
         except httpx.HTTPError:
             return failure(request, 502, BACKEND_UNAVAILABLE, "vLLM unavailable")

@@ -83,6 +83,41 @@ def slow_backend():
     server.server_close()
 
 
+@pytest.fixture
+def dripping_backend():
+    """Sends the headers, then one byte of the body every 0.5 s: no single read waits long, the whole answer does."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(16)
+    stop = threading.Event()
+
+    def serve(conn):
+        with conn:
+            conn.recv(65536)
+            body = b'{"data": []}'
+            try:
+                conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(body))
+                for byte in body:
+                    if stop.wait(0.5):
+                        return
+                    conn.sendall(bytes([byte]))
+            except OSError:
+                pass
+
+    def accept():
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                threading.Thread(target=serve, args=(server.accept()[0],), daemon=True).start()
+            except OSError:
+                continue
+
+    threading.Thread(target=accept, daemon=True).start()
+    yield f"http://127.0.0.1:{server.getsockname()[1]}"
+    stop.set()
+    server.close()
+
+
 SHORT = httpx.Timeout(0.3, connect=0.3)
 
 
@@ -111,6 +146,19 @@ def test_models_listing_times_out_when_the_backend_hangs(hung_backend):
         assert time.monotonic() - started < 3
     assert response.status_code == 504
     assert response.json()["code"] == "TIMEOUT"
+
+
+@pytest.mark.parametrize("path, status, code", [("/health", 503, "BACKEND_UNAVAILABLE"), ("/v1/models", 504, "TIMEOUT")])
+def test_a_backend_that_answers_in_slow_fragments_cannot_outlast_the_deadline(dripping_backend, path, status, code):
+    # Each read gets a byte within 0.5 s, so the 1 s read timeout never fires; only the overall deadline can stop it.
+    with patch.object(remote_vllm, "PROBE_TIMEOUT", httpx.Timeout(1.0, connect=1.0)), patch.object(
+        remote_vllm, "PROBE_DEADLINE", 1.5, create=True
+    ), TestClient(remote_vllm.build_remote_app(Engine(dripping_backend), chat_model="chat")) as client:
+        started = time.monotonic()
+        response = client.get(path)
+        took = time.monotonic() - started
+    assert took < 3  # the body alone takes 6 s
+    assert response.status_code == status and response.json()["code"] == code
 
 
 def test_probes_pass_and_chat_keeps_its_long_timeout(slow_backend):
