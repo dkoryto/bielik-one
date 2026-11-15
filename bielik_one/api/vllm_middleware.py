@@ -663,7 +663,9 @@ class SystemOneMiddleware:
                 self.settings.max_generation_tokens,
                 getattr(self.engine, "max_model_len", 32768),
             )
-            body = public_request_body(_scrub_sampling_params(raw), {self.settings.lora_name}, None, limits)
+            body = public_request_body(
+                _scrub_sampling_params(raw), {self.settings.lora_name}, None, limits, scope.get("path")
+            )
         except RequestError as exc:
             return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, exc.msg, fmt="openai"))
         replayed = False

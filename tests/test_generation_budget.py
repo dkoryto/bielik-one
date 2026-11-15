@@ -21,9 +21,12 @@ from tests.test_vllm_middleware import make_app
 LIMITS = GenerationLimits(max_n=16, max_tokens=131_072, context_tokens=32_768)
 
 
-def refused(body, limits=LIMITS):
+CHAT, COMPLETIONS, BATCH, RESPONSES = "/v1/chat/completions", "/v1/completions", "/v1/chat/completions/batch", "/v1/responses"
+
+
+def refused(body, route=None, limits=LIMITS):
     with pytest.raises(RequestError) as caught:
-        check_generation_budget(body, limits)
+        check_generation_budget(body, limits, route)
     return caught.value
 
 
@@ -31,83 +34,103 @@ def refused(body, limits=LIMITS):
 
 
 @pytest.mark.parametrize(
-    "body",
+    "route, body",
     [
-        {"messages": [{"role": "user", "content": "hi"}]},  # one answer, up to the full context
-        {"messages": [], "n": 4},  # four full-context answers: exactly the budget
-        {"messages": [], "n": 16, "max_tokens": 8192},
-        {"messages": [], "n": 16, "max_completion_tokens": 8192},
-        {"prompt": ["a"] * 1024, "max_tokens": 128},  # 1024 prompts x 128 tokens
-        {"prompt": list(range(5000)), "n": 4},  # one prompt given as token ids, not 5000 prompts
-        {"messages": [[{"role": "user", "content": "a"}]] * 8, "max_tokens": 16384},  # batch chat
-        {"input": "hi", "max_output_tokens": 4096},  # responses API
-        {"messages": [], "max_tokens": 10**9},  # longer than the context counts as the context
+        (CHAT, {"messages": [{"role": "user", "content": "hi"}]}),  # one answer, up to the full context
+        (CHAT, {"messages": [], "n": 4}),  # four full-context answers: exactly the budget
+        (None, {"messages": [], "n": 4}),  # the same on a route the filter does not know
+        (CHAT, {"messages": [], "n": 16, "max_tokens": 8192}),
+        (CHAT, {"messages": [], "n": 16, "max_completion_tokens": 8192}),
+        (COMPLETIONS, {"prompt": ["a"] * 1024, "max_tokens": 128}),  # 1024 prompts x 128 tokens
+        (COMPLETIONS, {"prompt": list(range(5000)), "n": 4}),  # one prompt given as token ids, not 5000 prompts
+        (BATCH, {"messages": [[{"role": "user", "content": "a"}]] * 8, "max_tokens": 16384}),
+        (RESPONSES, {"input": "hi", "max_output_tokens": 4096, "n": 16}),
+        (CHAT, {"messages": [], "max_tokens": 10**9}),  # longer than the context counts as the context
+        ("/api" + CHAT, {"messages": [], "n": 16, "max_tokens": 8192}),  # behind a root path
     ],
 )
-def test_requests_within_the_budget_pass(body):
-    check_generation_budget(body, LIMITS)
+def test_requests_within_the_budget_pass(route, body):
+    check_generation_budget(body, LIMITS, route)
 
 
 def test_n_over_the_limit_is_refused():
-    error = refused({"messages": [], "n": 1000, "max_tokens": 1})
+    error = refused({"messages": [], "n": 1000, "max_tokens": 1}, CHAT)
     assert error.loc == ["body", "n"]
     assert "n is 1000; this server allows at most 16" in error.msg
 
 
 def test_best_of_and_beam_width_are_counted():
-    error = refused({"prompt": "x", "n": 1, "best_of": 64, "max_tokens": 1})
+    error = refused({"prompt": "x", "n": 1, "best_of": 64, "max_tokens": 1}, COMPLETIONS)
     assert error.loc == ["body", "best_of"]
-    error = refused({"prompt": "x", "n": 17, "use_beam_search": True, "max_tokens": 1})  # n is the beam width
+    error = refused({"prompt": "x", "n": 17, "use_beam_search": True, "max_tokens": 1}, COMPLETIONS)  # beam width
     assert error.loc == ["body", "n"]
 
 
 @pytest.mark.parametrize(
-    "body, field, total",
+    "route, body, field, total",
     [
-        ({"messages": [], "n": 5}, "max_tokens", 5 * 32_768),  # max_tokens not set: full context per answer
-        ({"messages": [], "n": 16, "max_tokens": 16_384}, "max_tokens", 16 * 16_384),
-        ({"messages": [], "max_completion_tokens": 32_768, "n": 8}, "max_completion_tokens", 8 * 32_768),
-        ({"prompt": ["a"] * 1024, "max_tokens": 256}, "max_tokens", 1024 * 256),  # many prompts
-        ({"prompt": [[1, 2]] * 64, "max_tokens": 4096}, "max_tokens", 64 * 4096),  # many token-id prompts
-        ({"messages": [[{"role": "user", "content": "a"}]] * 64, "max_tokens": 4096}, "max_tokens", 64 * 4096),
-        ({"input": "hi", "max_output_tokens": 32_768, "n": 5}, "max_output_tokens", 5 * 32_768),
+        (CHAT, {"messages": [], "n": 5}, "max_tokens", 5 * 32_768),  # not set: full context per answer
+        (CHAT, {"messages": [], "n": 16, "max_tokens": 16_384}, "max_tokens", 16 * 16_384),
+        (CHAT, {"messages": [], "max_completion_tokens": 32_768, "n": 8}, "max_completion_tokens", 8 * 32_768),
+        (COMPLETIONS, {"prompt": ["a"] * 1024, "max_tokens": 256}, "max_tokens", 1024 * 256),  # many prompts
+        (COMPLETIONS, {"prompt": [[1, 2]] * 64, "max_tokens": 4096}, "max_tokens", 64 * 4096),  # token-id prompts
+        (BATCH, {"messages": [[{"role": "user", "content": "a"}]] * 64, "max_tokens": 4096}, "max_tokens", 64 * 4096),
+        (RESPONSES, {"input": "hi", "max_output_tokens": 32_768, "n": 5}, "max_output_tokens", 5 * 32_768),
     ],
 )
-def test_requests_over_the_token_budget_are_refused(body, field, total):
-    error = refused(body)
+def test_requests_over_the_token_budget_are_refused(route, body, field, total):
+    error = refused(body, route)
     assert error.loc == ["body", field]
     assert f"up to {total} output tokens" in error.msg and "at most 131072" in error.msg
 
 
 def test_unset_max_tokens_is_named_in_the_message():
-    assert "(max_tokens not set)" in refused({"messages": [], "n": 8}).msg
+    assert "(max_tokens not set)" in refused({"messages": [], "n": 8}, CHAT).msg
 
 
 @pytest.mark.parametrize("n", ["1000", " 1000 ", 1000.0, "1e3", 16.5])
 def test_counts_are_read_the_way_vllm_coerces_them(n):
     # vLLM's pydantic models accept "1000" and 1000.0 as n=1000; a fraction is rounded up, never down.
-    assert refused({"messages": [], "n": n, "max_tokens": 1}).loc == ["body", "n"]
+    assert refused({"messages": [], "n": n, "max_tokens": 1}, CHAT).loc == ["body", "n"]
 
 
 @pytest.mark.parametrize("max_tokens", ["32768", 32768.0])
 def test_token_limits_are_read_the_way_vllm_coerces_them(max_tokens):
-    assert refused({"messages": [], "n": 5, "max_tokens": max_tokens}).loc == ["body", "max_tokens"]
+    assert refused({"messages": [], "n": 5, "max_tokens": max_tokens}, CHAT).loc == ["body", "max_tokens"]
 
 
 def test_values_vllm_would_reject_anyway_are_not_counted():
     for body in ({"messages": [], "n": "many"}, {"messages": [], "n": None}, {"messages": [], "max_tokens": [5]},
                  {"messages": [], "n": float("nan")}, {"messages": [], "n": True}):
-        check_generation_budget(body, LIMITS)
+        check_generation_budget(body, LIMITS, CHAT)
 
 
-def test_the_largest_token_field_counts():
-    # /v1/completions reads max_tokens; a small max_completion_tokens next to it must not hide it.
-    body = {"prompt": "x", "n": 8, "max_completion_tokens": 1, "max_tokens": 32_768}
-    error = refused(body)
+def test_only_the_field_the_route_reads_counts():
+    # Chat ignores max_output_tokens, so it cannot stand in for an unset max_tokens.
+    error = refused({"messages": [], "n": 16, "max_output_tokens": 1}, CHAT)
+    assert error.loc == ["body", "max_tokens"] and "up to 524288 output tokens" in error.msg
+    # Completions reads max_tokens; a small max_completion_tokens next to it must not hide it.
+    error = refused({"prompt": "x", "n": 8, "max_completion_tokens": 1, "max_tokens": 32_768}, COMPLETIONS)
     assert error.loc == ["body", "max_tokens"] and "up to 262144 output tokens" in error.msg
-    assert refused({"messages": [], "n": 8, "max_tokens": 1, "max_output_tokens": 30_000}).loc == ["body", "max_output_tokens"]
-    # The filter does not know which field the route will read, so contradictory limits count at the larger one.
-    assert refused({"messages": [], "n": 16, "max_completion_tokens": 8192, "max_tokens": 10**9}).loc == ["body", "max_tokens"]
+    # Chat prefers max_completion_tokens, as vLLM does, so a huge max_tokens next to it does not count.
+    check_generation_budget({"messages": [], "n": 16, "max_completion_tokens": 8192, "max_tokens": 10**9}, LIMITS, CHAT)
+
+
+def test_routes_the_filter_does_not_know_count_the_costliest_reading():
+    # /invocations hands the body to the chat or the completions handler, whichever validates.
+    body = {"messages": [], "n": 16, "max_completion_tokens": 8192, "max_tokens": 10**9}
+    assert refused(body, "/invocations").loc == ["body", "max_tokens"]
+    assert refused({"messages": [], "n": 16, "max_output_tokens": 1}, "/invocations").loc == ["body", "max_tokens"]
+
+
+def test_messages_cannot_lower_the_prompt_count_of_completions():
+    # vLLM ignores messages on /v1/completions and answers all 1024 prompts.
+    body = {"prompt": ["x"] * 1024, "messages": [[]], "max_tokens": 256}
+    error = refused(body, COMPLETIONS)
+    assert "up to 262144 output tokens (1024 prompt(s)" in error.msg
+    # And the other way round on batch chat.
+    body = {"prompt": "x", "messages": [[{"role": "user", "content": "a"}]] * 64, "max_tokens": 4096}
+    assert "(64 prompt(s)" in refused(body, BATCH).msg
 
 
 def test_token_in_sampling_params_are_checked():
@@ -159,6 +182,14 @@ def test_frontend_refuses_over_budget_requests_before_vllm(path):
         assert response.status_code == 502  # passed the filter, then found no vLLM
 
 
+def test_frontend_passes_the_route():
+    app = remote_vllm.build_remote_app(Engine(), chat_model="chat")
+    with TestClient(app) as client:
+        body = {"model": "chat", "prompt": ["x"] * 1024, "messages": [[]], "max_tokens": 256}
+        assert client.post("/v1/completions", json=body).status_code == 400  # 1024 prompts, not 1 conversation
+        assert client.post("/v1/chat/completions", json={"messages": [], "n": 16, "max_output_tokens": 1}).status_code == 400
+
+
 def test_frontend_uses_configured_limits():
     limits = GenerationLimits(max_n=2, max_tokens=1000)
     app = remote_vllm.build_remote_app(Engine(), chat_model="chat", generation_limits=limits)
@@ -181,6 +212,10 @@ def test_middleware_refuses_over_budget_requests_on_every_public_route():
             assert client.post(path, json={"model": "base-a", "messages": [], "n": "1000"}).status_code == 400, path
             ok = client.post(path, json={"model": "base-a", "messages": [], "n": 2, "max_tokens": 64})
             assert ok.status_code == 200, path
+        # The route decides which limit field counts: chat ignores max_output_tokens, responses reads it.
+        over = {"model": "base-a", "messages": [], "input": "x", "n": 16, "max_output_tokens": 1}
+        assert client.post("/v1/chat/completions", json=over).status_code == 400
+        assert client.post("/v1/responses", json=over).status_code == 200
         # Token-in requests carry n and max_tokens in sampling_params.
         token_in = {"model": "base-a", "token_ids": [1, 2], "sampling_params": {"n": 1000, "max_tokens": 1}}
         assert client.post("/inference/v1/generate", json=token_in).status_code == 400

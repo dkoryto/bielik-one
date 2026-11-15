@@ -461,17 +461,39 @@ def _count(value) -> int | None:
     return None
 
 
-TOKEN_FIELDS = ("max_completion_tokens", "max_tokens", "max_output_tokens")
+# Which limit field each route reads, as vLLM 0.32 does: a reading is the fields tried in order, the first one set
+# wins, and an answer with none of them set runs to the end of the context. Chat prefers max_completion_tokens.
+_CHAT = ("max_completion_tokens", "max_tokens")
+ROUTE_READINGS = {
+    "/v1/completions": (("max_tokens",),),
+    "/v1/chat/completions": (_CHAT,),
+    "/v1/chat/completions/batch": (_CHAT,),
+    "/v1/responses": (("max_output_tokens",),),
+    "/v1/messages": (("max_tokens",),),
+}
+# Any other route (for example /invocations, which picks the handler from the body): the costliest of the readings.
+ANY_READING = (_CHAT, ("max_tokens",), ("max_output_tokens",))
 
 
-def check_generation_budget(body: dict, limits: GenerationLimits, loc: tuple[str, ...] = ()) -> None:
+def _readings(route: str | None) -> tuple[tuple[str, ...], ...]:
+    if route:
+        for path, readings in ROUTE_READINGS.items():
+            if route == path or route.endswith(path) and route[: -len(path)].startswith("/"):  # behind a root path
+                return readings
+    return ANY_READING
+
+
+def check_generation_budget(
+    body: dict, limits: GenerationLimits, route: str | None = None, loc: tuple[str, ...] = ()
+) -> None:
     """Refuse a request that asks for more answers, or more output tokens in all, than the limits allow.
 
-    The cost counted is prompts x answers per prompt x tokens per answer: completions take a list of prompts, batch
-    chat a list of conversations, and n (or best_of, which is also the beam width for beam search) multiplies each.
-    The tokens per answer are the largest of max_completion_tokens, max_tokens and max_output_tokens, whichever the
-    route reads, and the full context when none is set. Token-in requests carry these fields in sampling_params,
-    which is checked the same way.
+    The cost counted is prompts x answers per prompt x tokens per answer. Prompts are the longer of a completions
+    prompt list and a batch chat's list of conversations (vLLM ignores the field its route does not use, so neither
+    may lower the count). n, or best_of (also the beam width for beam search), multiplies each. Tokens per answer come
+    from the field the route reads (`route` is the request path), and are the full context when that field is not
+    set; for a route not listed, the costliest reading counts. Token-in requests carry these fields in
+    sampling_params, which is checked the same way.
     """
     n = _count(body.get("n")) or 1
     best_of = _count(body.get("best_of")) or 0
@@ -484,11 +506,15 @@ def check_generation_budget(body: dict, limits: GenerationLimits, loc: tuple[str
         prompts = len(prompt)  # several prompts (text or token lists), not one prompt given as token ids
     messages = body.get("messages")
     if isinstance(messages, list) and messages and all(isinstance(m, list) for m in messages):
-        prompts = len(messages)  # /v1/chat/completions/batch: one answer per conversation
-    given = [(value, name) for name in TOKEN_FIELDS if (value := _count(body.get(name))) is not None and value >= 1]
-    per_answer, field = max(given) if given else (None, "max_tokens")
-    unset = per_answer is None
-    per_answer = limits.context_tokens if unset else min(per_answer, limits.context_tokens)
+        prompts = max(prompts, len(messages))  # /v1/chat/completions/batch: one answer per conversation
+    costs = []  # (tokens per answer, field named in an error, whether it was unset)
+    for reading in (("max_tokens",),) if loc else _readings(route):
+        found = next(((v, name) for name in reading if (v := _count(body.get(name))) is not None and v >= 1), None)
+        if found is None:
+            costs.append((limits.context_tokens, reading[-1], True))
+        else:
+            costs.append((min(found[0], limits.context_tokens), found[1], False))
+    per_answer, field, unset = max(costs)
     total = prompts * width * per_answer
     if limits.max_tokens is not None and total > limits.max_tokens:
         unit = f"{per_answer} tokens each" + (f" ({field} not set)" if unset else "")
@@ -498,7 +524,7 @@ def check_generation_budget(body: dict, limits: GenerationLimits, loc: tuple[str
             f"this server allows at most {limits.max_tokens} per request. Set {field} or ask for fewer answers",
         )
     if not loc and isinstance(body.get("sampling_params"), dict):
-        check_generation_budget(body["sampling_params"], limits, ("sampling_params",))
+        check_generation_budget(body["sampling_params"], limits, route, ("sampling_params",))
 
 
 def public_request_body(
@@ -506,6 +532,7 @@ def public_request_body(
     decision_models=frozenset(),
     chat_model: str | None = None,
     limits: GenerationLimits = GenerationLimits(),
+    route: str | None = None,
 ) -> bytes:
     """Ordinary chat/completion requests from clients: drop internal decision flags; reject prompt logprobs and
     requests over the generation budget.
@@ -540,7 +567,7 @@ def public_request_body(
         raise RequestError(
             ["prompt_logprobs"], "prompt logprobs are not supported by this server"
         )
-    check_generation_budget(body, limits)
+    check_generation_budget(body, limits, route)
     if "vllm_xargs" in body:
         body.pop("vllm_xargs")
         changed = True
@@ -645,7 +672,7 @@ def build_remote_app(
     async def forward(request: Request):
         try:
             body = public_request_body(
-                await request.body(), engine.aliases, chat_model, limits
+                await request.body(), engine.aliases, chat_model, limits, request.url.path
             )
         except RequestError as exc:
             return failure(request, 400, INVALID_REQUEST, exc.msg)
