@@ -66,27 +66,28 @@ FULL_REVISION = re.compile(r"[0-9a-f]{40}")
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
-def manifest_sha256(root: Path) -> str:
-    """The SHA-256 of the package's SHA256SUMS.json, the one value that pins every file it lists."""
+def read_manifest(root: Path) -> bytes:
     path = root / "SHA256SUMS.json"
     if not path.is_file():
         raise ValueError("SHA256SUMS.json is missing; download the complete repository")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return path.read_bytes()
 
 
-def check_manifest(root: Path, expected: str | None) -> str:
-    """The manifest's digest; with `expected` (obtained independently of the package), it must match.
+def check_manifest(root: Path, expected: str | None) -> tuple[str, bytes]:
+    """The manifest's digest and bytes; with `expected` (obtained independently of the package), they must match.
 
     verify() checks the files against SHA256SUMS.json, which travels with them: a package republished together with
-    a matching manifest passes it. A digest recorded from a trusted source closes that gap.
+    a matching manifest passes it. A digest recorded from a trusted source closes that gap. Pass the returned bytes
+    to verify(), so the manifest that was pinned is the one the files are checked against.
     """
-    digest = manifest_sha256(root)
+    raw = read_manifest(root)
+    digest = hashlib.sha256(raw).hexdigest()
     if expected is not None and not hmac.compare_digest(digest, expected.lower()):
         raise ValueError(
             f"SHA256SUMS.json has SHA-256 {digest}, not the pinned {expected.lower()}; "
             "this is not the package you pinned"
         )
-    return digest
+    return digest, raw
 
 
 def snapshot_revision(root: Path) -> str | None:
@@ -108,12 +109,9 @@ def resolve_package(spec: str, revision: str | None = None) -> Path:
     raise ValueError(f"{spec}: not a package directory or a Hugging Face repo id")
 
 
-def verify(root: Path) -> dict:
+def verify(root: Path, manifest: bytes | None = None) -> dict:
     """Verify runtime files and all weights; ignore only known root-level auxiliary files."""
-    path = root / "SHA256SUMS.json"
-    if not path.is_file():
-        raise ValueError("SHA256SUMS.json is missing; download the complete repository")
-    sums = json.loads(path.read_text())
+    sums = json.loads(manifest if manifest is not None else read_manifest(root))
     for relative, expected in sums.items():
         # Checked by name, not by resolving: HF cache snapshots are symlinks into blobs/.
         pure = PurePosixPath(relative)
@@ -557,8 +555,8 @@ def main(argv=None):
     except ValueError as exc:
         p.error(str(exc))
     try:
-        digest = check_manifest(root, a.manifest_sha256)
-        verify(root)
+        digest, manifest = check_manifest(root, a.manifest_sha256)
+        verify(root, manifest)
         kind = detect(root)
     except (ValueError, FileNotFoundError) as exc:
         p.error(f"{root}: {exc}")

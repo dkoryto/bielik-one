@@ -171,8 +171,8 @@ def build_engine(settings: Settings):
     from bielik_one.api.remote_vllm import RemoteVllmEngine, resolve_calibration
 
     root = settings.package
-    launch.check_manifest(root, settings.manifest_sha256)
-    launch.verify(root)
+    _, manifest = launch.check_manifest(root, settings.manifest_sha256)
+    launch.verify(root, manifest)
     kind = launch.detect(root)
     if kind not in ("llama-adapter", "qwen-adapter"):
         raise RuntimeError(f"{root}: a {kind} package; the middleware serves adapter packages (*-Adapter)")

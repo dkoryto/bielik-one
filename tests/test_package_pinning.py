@@ -126,3 +126,13 @@ def test_middleware_refuses_a_package_that_does_not_match_before_anything_else()
         ):
             middleware.build_engine(settings)
         download.assert_not_called()
+
+
+def test_files_are_checked_against_the_pinned_bytes_of_the_manifest(local_package):
+    # If the package changes between the digest check and verify(), verify() still uses the manifest that was pinned.
+    pinned = digest(local_package)
+    _, manifest = launch.check_manifest(local_package, pinned)
+    republish(local_package)  # calibration.json and SHA256SUMS.json both change on disk
+    with pytest.raises(ValueError, match="Checksum mismatch: calibration.json"):
+        launch.verify(local_package, manifest)
+    launch.verify(local_package)  # reading the new manifest instead would accept it
