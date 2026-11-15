@@ -7,6 +7,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import contextvars
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -428,10 +429,73 @@ class RemoteVllmEngine(LetterEngine):
         return super().evaluate(body)
 
 
+# What one public generation request (chat, completions, responses, messages) may ask vLLM to produce. vLLM itself
+# accepts n up to 16384 and up to 1024 prompts per completions request, each answer running to the end of the context
+# when max_tokens is not set.
+DEFAULT_MAX_GENERATION_N = 16
+DEFAULT_MAX_GENERATION_TOKENS = 131_072  # four full answers at the 32k context of every launcher profile
+CONTEXT_TOKENS = 32768  # --max-model-len of the launcher profiles: how long an answer without max_tokens can run
+
+
+@dataclass(frozen=True)
+class GenerationLimits:
+    """Per-request budget for public generation. None lifts a limit."""
+
+    max_n: int | None = DEFAULT_MAX_GENERATION_N
+    max_tokens: int | None = DEFAULT_MAX_GENERATION_TOKENS
+    context_tokens: int = CONTEXT_TOKENS
+
+
+def _int_field(body: dict, name: str) -> int | None:
+    value = body.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def check_generation_budget(body: dict, limits: GenerationLimits) -> None:
+    """Refuse a request that asks for more answers, or more output tokens in all, than the limits allow.
+
+    The cost counted is prompts x answers per prompt x tokens per answer: completions take a list of prompts, batch
+    chat a list of conversations, and n (or best_of, which is also the beam width for beam search) multiplies each.
+    An answer without max_tokens / max_completion_tokens / max_output_tokens counts as the full context. Fields of the
+    wrong type are left for vLLM to reject.
+    """
+    n = _int_field(body, "n") or 1
+    best_of = _int_field(body, "best_of") or 0
+    width, width_field = (best_of, "best_of") if best_of > n else (n, "n")
+    if limits.max_n is not None and width > limits.max_n:
+        raise RequestError([width_field], f"{width_field} is {width}; this server allows at most {limits.max_n}")
+    prompts = 1
+    prompt = body.get("prompt")
+    if isinstance(prompt, list) and prompt and not all(isinstance(token, int) for token in prompt):
+        prompts = len(prompt)  # several prompts (text or token lists), not one prompt given as token ids
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages and all(isinstance(m, list) for m in messages):
+        prompts = len(messages)  # /v1/chat/completions/batch: one answer per conversation
+    field, per_answer = next(
+        ((name, value) for name in ("max_completion_tokens", "max_tokens", "max_output_tokens")
+         if (value := _int_field(body, name)) is not None),
+        ("max_tokens", None),
+    )
+    unset = per_answer is None or per_answer < 1
+    per_answer = limits.context_tokens if unset else min(per_answer, limits.context_tokens)
+    total = prompts * width * per_answer
+    if limits.max_tokens is not None and total > limits.max_tokens:
+        unit = f"{per_answer} tokens each" + (f" ({field} not set)" if unset else "")
+        raise RequestError(
+            [field],
+            f"this request asks for up to {total} output tokens ({prompts} prompt(s) x {width} answer(s) x {unit}); "
+            f"this server allows at most {limits.max_tokens} per request. Set {field} or ask for fewer answers",
+        )
+
+
 def public_request_body(
-    raw: bytes, decision_models=frozenset(), chat_model: str | None = None
+    raw: bytes,
+    decision_models=frozenset(),
+    chat_model: str | None = None,
+    limits: GenerationLimits = GenerationLimits(),
 ) -> bytes:
-    """Ordinary chat/completion requests from clients: drop internal decision flags; reject prompt logprobs.
+    """Ordinary chat/completion requests from clients: drop internal decision flags; reject prompt logprobs and
+    requests over the generation budget.
 
     vllm_xargs could switch rows to decision heads; prompt logprobs and echo+logprobs are not supported by the
     decision-head backend. The decision model names are rejected: they answer typed questions at /v1/systemone,
@@ -463,6 +527,7 @@ def public_request_body(
         raise RequestError(
             ["prompt_logprobs"], "prompt logprobs are not supported by this server"
         )
+    check_generation_budget(body, limits)
     if "vllm_xargs" in body:
         body.pop("vllm_xargs")
         changed = True
@@ -495,7 +560,10 @@ def install_backend_errors(app, error_format: str = "default"):
 
 
 def build_remote_app(
-    engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default"
+    engine: RemoteVllmEngine,
+    chat_model: str | None = None,
+    error_format: str = "default",
+    generation_limits: GenerationLimits | None = None,
 ):
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from starlette.background import BackgroundTask
@@ -559,10 +627,12 @@ def build_remote_app(
             content, status_code=response.status_code, media_type="application/json"
         )
 
+    limits = generation_limits or GenerationLimits(context_tokens=getattr(engine, "max_model_len", CONTEXT_TOKENS))
+
     async def forward(request: Request):
         try:
             body = public_request_body(
-                await request.body(), engine.aliases, chat_model
+                await request.body(), engine.aliases, chat_model, limits
             )
         except RequestError as exc:
             return failure(request, 400, INVALID_REQUEST, exc.msg)
@@ -626,6 +696,40 @@ def add_calibration_arguments(parser):
     )
 
 
+def _positive_int_or_none(text: str) -> int | None:
+    """argparse type: a whole number of at least 1, or "none" to lift the limit."""
+    if text.strip().lower() == "none":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1 (or none)")
+    return value
+
+
+def add_generation_arguments(parser):
+    parser.add_argument(
+        "--max-generation-n",
+        type=_positive_int_or_none,
+        default=DEFAULT_MAX_GENERATION_N,
+        help="largest n (or best_of, the beam width) one chat/completions request may ask for; "
+        f"'none' lifts it (default: {DEFAULT_MAX_GENERATION_N})",
+    )
+    parser.add_argument(
+        "--max-generation-tokens",
+        type=_positive_int_or_none,
+        default=DEFAULT_MAX_GENERATION_TOKENS,
+        help="output tokens one chat/completions request may ask for in all (prompts x n x max_tokens, an unset "
+        f"max_tokens counting as the full context); 'none' lifts it (default: {DEFAULT_MAX_GENERATION_TOKENS})",
+    )
+
+
+def generation_limits(args, context_tokens: int = CONTEXT_TOKENS) -> GenerationLimits:
+    return GenerationLimits(args.max_generation_n, args.max_generation_tokens, context_tokens)
+
+
 def main():
     import uvicorn
     from bielik_one.api.reasoning import EndpointReasoner
@@ -643,6 +747,7 @@ def main():
     )
     add_calibration_arguments(parser)
     add_guard_arguments(parser)
+    add_generation_arguments(parser)
     args = parser.parse_args()
     metadata = json.loads(args.metadata.read_text())
     table, source = resolve_calibration(
@@ -666,7 +771,10 @@ def main():
     )
     uvicorn.run(
         guarded(
-            build_remote_app(engine, chat_model=args.base_model, error_format=args.error_format),
+            build_remote_app(
+                engine, chat_model=args.base_model, error_format=args.error_format,
+                generation_limits=generation_limits(args, getattr(engine, "max_model_len", CONTEXT_TOKENS)),
+            ),
             args.max_body_mb,
             args.error_format,
         ),
