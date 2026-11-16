@@ -38,7 +38,7 @@ Tune the rate and connection limits to your traffic. They protect the GPU from o
 
 Do not build your own scheme. Use one your organisation already runs:
 
-- **HTTP Basic over TLS** (as in the reference files): create users with `htpasswd -B /etc/nginx/bielik-one.htpasswd alice`, or `openssl passwd -apr1` if `htpasswd` is not installed. Suitable for a few service accounts.
+- **HTTP Basic over TLS** (as in the reference files): create the file with the first user, `htpasswd -cB /etc/nginx/bielik-one.htpasswd alice`, and add later users without `-c` (`htpasswd -B /etc/nginx/bielik-one.htpasswd bob`), because `-c` overwrites an existing file. If `htpasswd` is not installed, append one `user:hash` line per user: `printf 'alice:%s\n' "$(openssl passwd -apr1)" | sudo tee -a /etc/nginx/bielik-one.htpasswd`. Suitable for a few service accounts.
 - **Single sign-on (OIDC):** put an authenticating proxy such as oauth2-proxy next to nginx and replace `auth_basic` with `auth_request /oauth2/auth;` following that proxy's nginx guide.
 - **Client certificates (mTLS):** for machine clients, replace `auth_basic` with `ssl_client_certificate /etc/nginx/tls/clients-ca.pem; ssl_verify_client on;`.
 
@@ -63,6 +63,14 @@ curl -s -o /dev/null -w '%{http_code}\n' https://$H/health                      
 curl -s -o /dev/null -w '%{http_code}\n' -u alice https://$H/docs                           # 404
 curl -s -u alice https://$H/v1/systemone -H 'Content-Type: application/json' -d '{
   "model": "decision", "state": "The invoice is overdue.",
-  "questions": {"late": {"type": "noul", "instructions": "Is the payment late?"}}}'         # an answer
+  "questions": {"late": {"type": "noul", "instructions": "Is the payment late?"}}}'         # an answer (frontend)
 curl -s -o /dev/null -w '%{http_code}\n' http://$H:8026/health                             # connection refused
+```
+
+With the middleware, `decision` is the internal adapter name and is refused (422). Use the base model's public name instead, one of those listed by `curl -s -u alice https://$H/v1/models` (for example `bielik-base`):
+
+```bash
+curl -s -u alice https://$H/v1/systemone -H 'Content-Type: application/json' -d '{
+  "model": "bielik-base", "state": "The invoice is overdue.",
+  "questions": {"late": {"type": "noul", "instructions": "Is the payment late?"}}}'         # an answer (middleware)
 ```
