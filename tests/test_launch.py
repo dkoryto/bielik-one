@@ -389,3 +389,117 @@ class PrintedCommandTests(unittest.TestCase):
             with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
                 launch.main(["frontend", d, "--shell"])
             self.assertIn("--backend-url", err.getvalue())
+
+
+class BielikChatParserTests(unittest.TestCase):
+    def setUp(self):
+        env = unittest.mock.patch.dict("os.environ", {"BIELIK_TOOLS_DIR": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def make_package(self, root, model="speakleash/Bielik-11B-v3.1-Instruct"):
+        (root / "chat_template.jinja").write_text("PINNED DECISION")
+        package("llama-adapter", root)
+        path = root / "serving.json"
+        serving = json.loads(path.read_text())
+        serving["base_model"] = model
+        path.write_text(json.dumps(serving))
+        sums_path = root / "SHA256SUMS.json"
+        sums = json.loads(sums_path.read_text())
+        sums.pop("SHA256SUMS.json", None)
+        sums["serving.json"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        sums_path.write_text(json.dumps(sums))
+
+    def make_tools(self, root):
+        tools = root / "tools"
+        tools.mkdir()
+        for name in (
+            "bielik_vllm_tool_parser.py", "bielik_vllm_reasoning_parser.py",
+            "bielik_advanced_chat_template.jinja",
+        ):
+            (tools / name).write_text("EXTERNAL")
+        return tools
+
+    def test_supported_models_flags_and_separate_decision_template(self):
+        for model, advanced in launch.BIELIK_CHAT_MODELS.items():
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                self.make_package(root, model)
+                tools = self.make_tools(root)
+                before = dry("backend", d)["command"]
+                after = dry("backend", d, "--bielik-tools-dir", d)["command"]
+                self.assertEqual(after[:len(before)], before)
+                for flag in ("--enable-auto-tool-choice", "--exclude-tools-when-tool-choice-none"):
+                    self.assertEqual(after.count(flag), 1)
+                for flag, name in (("--tool-parser-plugin", "bielik_vllm_tool_parser.py"),
+                                   ("--reasoning-parser-plugin", "bielik_vllm_reasoning_parser.py")):
+                    self.assertEqual(after[after.index(flag) + 1], str(tools / name))
+                for flag in ("--tool-call-parser", "--reasoning-parser"):
+                    self.assertEqual(after[after.index(flag) + 1], "bielik")
+                self.assertEqual("--chat-template" in after, advanced)
+                if advanced:
+                    self.assertEqual(after[after.index("--chat-template") + 1],
+                                     str(tools / "bielik_advanced_chat_template.jinja"))
+                front = dry("frontend", d)["command"]
+                metadata = json.loads(Path(front[front.index("--metadata") + 1]).read_text())
+                self.assertEqual(metadata["chat_template_path"], str(root / "chat_template.jinja"))
+                self.assertEqual((root / "chat_template.jinja").read_text(), "PINNED DECISION")
+
+    def test_environment_cli_override_opt_out_and_shell_from_other_cwd(self):
+        with tempfile.TemporaryDirectory(prefix="chat parsers ") as d:
+            root = Path(d)
+            self.make_package(root)
+            tools = self.make_tools(root)
+            with unittest.mock.patch.dict("os.environ", {"BIELIK_TOOLS_DIR": "/missing/env/checkout"}):
+                # Explicit CLI wins over the environment; paths survive spaces/foreign cwd.
+                with contextlib.chdir(root.parent):
+                    command = dry("backend", str(root), "--bielik-tools-dir", root.name)["command"]
+                self.assertEqual(command[command.index("--tool-parser-plugin") + 1],
+                                 str(tools / "bielik_vllm_tool_parser.py"))
+                disabled = dry("backend", d, "--no-bielik-chat-parsers")["command"]
+                self.assertNotIn("--tool-call-parser", disabled)
+                # A global backend setting does not alter frontend decision metadata.
+                self.assertNotIn("--tool-call-parser", dry("frontend", d)["command"])
+            with unittest.mock.patch.dict("os.environ", {"BIELIK_TOOLS_DIR": d}):
+                enabled = dry("backend", d)["command"]
+                self.assertEqual(enabled, command)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    launch.main(["backend", d, "--shell"])
+                self.assertEqual(shlex.split(out.getvalue())[1 + len(launch.LAUNCH_ENV) + 2:], enabled)
+
+    def test_invalid_models_modes_and_missing_resources_fail_before_exec(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.make_package(root)
+            tools = self.make_tools(root)
+            for missing in ("bielik_vllm_tool_parser.py", "bielik_vllm_reasoning_parser.py"):
+                path = tools / missing
+                path.unlink()
+                with self.assertRaisesRegex(ValueError, missing):
+                    dry("backend", d, "--bielik-tools-dir", d)
+                path.write_text("EXTERNAL")
+            for args in (("frontend", d), ("backend", d, "--engine", "mlx")):
+                with self.assertRaisesRegex(ValueError, "vLLM backend options"):
+                    dry(*args, "--bielik-tools-dir", d)
+            self.make_package(root, "org/unrecognized-llama")
+            with self.assertRaisesRegex(ValueError, "unsupported base model"):
+                dry("backend", d, "--bielik-tools-dir", d)
+        for kind in ("qwen-adapter", "qwen-merged", "llama-merged"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
+                package(kind, Path(d))
+                with self.assertRaisesRegex(ValueError, "Bielik adapter packages only"):
+                    dry("backend", d, "--bielik-tools-dir", d)
+
+    def test_advanced_template_required_only_for_30(self):
+        for model, advanced in launch.BIELIK_CHAT_MODELS.items():
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                self.make_package(root, model)
+                tools = self.make_tools(root)
+                (tools / "bielik_advanced_chat_template.jinja").unlink()
+                if advanced:
+                    with self.assertRaisesRegex(ValueError, "bielik_advanced_chat_template.jinja"):
+                        dry("backend", d, "--bielik-tools-dir", d)
+                else:
+                    dry("backend", d, "--bielik-tools-dir", d)

@@ -111,6 +111,22 @@ The chat routes answer errors in the OpenAI format, `{"error": {"message", "type
 
 Ordinary chat and completions go to `/v1/chat/completions` and `/v1/completions` on the same port, with the package's chat model alias (listed by `/v1/models`, e.g. `bielik-base`, `qwen-base` or `qwen-general`; requests without a model get it); the `decision` model is rejected there. Interactive docs: `/docs`.
 
+### Tools and reasoning for Bielik adapter chat
+
+To enable the ordinary chat model's tool-call and reasoning parsers on vLLM 0.32.0, point the backend at a local [bielik-tools](https://github.com/speakleash/bielik-tools) checkout compatible with that vLLM version:
+
+```bash
+bielik-one backend speakleash/Bielik-One-11B-v3.1-r1-Adapter \
+  --bielik-tools-dir /opt/bielik-tools --dry-run
+# Remove --dry-run to start the backend; start bielik-one frontend as usual.
+```
+
+This enables `--enable-auto-tool-choice`, both `bielik` parsers via `--tool-parser-plugin` / `--reasoning-parser-plugin`, and `--exclude-tools-when-tool-choice-none`. The directory is the repository root containing `tools/`, not `tools/` itself. The launcher checks that the required files exist and passes absolute paths, so it also works from another working directory or a pip installation. Parser code runs inside vLLM: use a trusted checkout pinned to a revision you have tested. No parser files are copied, downloaded or updated by bielik-one.
+
+Supported adapter bases are `speakleash/Bielik-11B-v3.1-Instruct`, `speakleash/Bielik-11B-v3.0-Instruct` and `speakleash/Bielik-Minitron-7B-v3.0-Instruct`. Bielik 3.1 keeps the base checkpoint's chat template; request thinking with `chat_template_kwargs={"reasoning_effort": "medium"}` (or `none`, `low`, `high`, `max`). The two 3.0 bases use upstream `tools/bielik_advanced_chat_template.jinja` for chat; request thinking with `chat_template_kwargs={"enable_thinking": true}` and `skip_special_tokens: false`. The package's pinned **decision** template and token rendering stay separate. Parser setup does not establish model quality or GPU parity.
+
+Alternatively set `BIELIK_TOOLS_DIR=/opt/bielik-tools`. An explicit `--bielik-tools-dir` overrides it; `--no-bielik-chat-parsers` disables it for one backend invocation. With neither configured, the command stays unchanged. The environment variable is only used by the vLLM backend, so the frontend and MLX ignore it; explicit parser options on those commands are rejected. Configuring the directory for an unsupported base, Qwen or a merged package is rejected. For custom parser/template flags, use `--no-bielik-chat-parsers --shell` and edit the printed vLLM command to avoid duplicate flags. Both `--shell` and `--dry-run` include the configured parser flags; the same printed command can be used with the single-server middleware below.
+
 ## Running vLLM yourself
 
 `bielik-one backend` only verifies the package and starts an ordinary `vllm serve` with a validated set of flags; the decisions are computed by `bielik-one frontend`. To run vLLM under your own process manager or container, print the exact command and start it yourself:
