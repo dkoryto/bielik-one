@@ -318,6 +318,46 @@ def backend(
     return argv, {"VLLM_PLUGINS": "", "VLLM_MAX_NUM_BAD_WORDS": "2048"}
 
 
+# Chat parsers are maintained upstream, not copied into bielik-one. Keep this
+# allowlist separate from the decision tokenizer/template pinned by the package.
+BIELIK_CHAT_MODELS = {
+    "speakleash/Bielik-11B-v3.1-Instruct": False,
+    "speakleash/Bielik-11B-v3.0-Instruct": True,
+    "speakleash/Bielik-Minitron-7B-v3.0-Instruct": True,
+}
+
+
+def bielik_chat_args(root: Path, kind: str, tools_dir: str) -> list[str]:
+    """Opt-in chat setup from a local bielik-tools checkout (vLLM 0.32)."""
+    if kind != "llama-adapter":
+        raise ValueError("--bielik-tools-dir supports Bielik adapter packages only")
+    model = json.loads((root / "serving.json").read_text())["base_model"]
+    if model not in BIELIK_CHAT_MODELS:
+        raise ValueError(f"--bielik-tools-dir: unsupported base model {model!r}")
+    tools = Path(tools_dir).expanduser().resolve() / "tools"
+    tool_parser = tools / "bielik_vllm_tool_parser.py"
+    reasoning_parser = tools / "bielik_vllm_reasoning_parser.py"
+    template = tools / "bielik_advanced_chat_template.jinja"
+    advanced_template = BIELIK_CHAT_MODELS[model]
+    required = [tool_parser, reasoning_parser] + ([template] if advanced_template else [])
+    for path in required:
+        if not path.is_file():
+            raise ValueError(f"Missing bielik-tools file: {path}; use a checkout supporting vLLM 0.32")
+    argv = [
+        "--enable-auto-tool-choice",
+        "--tool-parser-plugin", str(tool_parser),
+        "--tool-call-parser", "bielik",
+        "--reasoning-parser-plugin", str(reasoning_parser),
+        "--reasoning-parser", "bielik",
+        "--exclude-tools-when-tool-choice-none",
+    ]
+    # Bielik 3.1 already ships its tool/reasoning template. The 3.0 models
+    # need the upstream advanced template for ordinary chat, not for decisions.
+    if advanced_template:
+        argv += ["--chat-template", str(template)]
+    return argv
+
+
 def frontend(
     root: Path,
     kind: str,
@@ -445,6 +485,18 @@ def main(argv=None):
         help="model package: a Hugging Face repo id (downloaded to the HF cache) or a local directory",
     )
     p.add_argument("--revision", help="revision of a Hugging Face repo id (default: main)")
+    chat = p.add_mutually_exclusive_group()
+    chat.add_argument(
+        "--bielik-tools-dir",
+        metavar="DIR",
+        help="vLLM backend: enable tools/reasoning for Bielik 3.1, 3.0 or Minitron 3.0 adapters "
+        "using this bielik-tools checkout (default: BIELIK_TOOLS_DIR); no files are downloaded",
+    )
+    chat.add_argument(
+        "--no-bielik-chat-parsers",
+        action="store_true",
+        help="vLLM backend: ignore BIELIK_TOOLS_DIR and leave chat parsers/template unchanged",
+    )
     p.add_argument(
         "--host",
         default="127.0.0.1",
@@ -531,6 +583,10 @@ def main(argv=None):
         "without starting it, to run vLLM yourself; see README, 'Running vLLM yourself'",
     )
     a = p.parse_args(argv)
+    if (a.bielik_tools_dir is not None or a.no_bielik_chat_parsers) and (
+        a.component != "backend" or a.engine != "vllm"
+    ):
+        p.error("--bielik-tools-dir and --no-bielik-chat-parsers are vLLM backend options")
     if a.shell and a.component != "backend":
         p.error(
             "--shell prints the vLLM backend command; start the API with "
@@ -585,6 +641,14 @@ def main(argv=None):
         argv, extra = backend(
             root, kind, a.backend_host, a.port or back_port, a.fp8, a.eager
         )
+        tools_dir = None if a.no_bielik_chat_parsers else (
+            a.bielik_tools_dir if a.bielik_tools_dir is not None else os.environ.get("BIELIK_TOOLS_DIR")
+        )
+        if tools_dir:
+            try:
+                argv += bielik_chat_args(root, kind, tools_dir)
+            except ValueError as exc:
+                p.error(str(exc))
         argv = override(argv, "--max-num-seqs", a.max_num_seqs)
         argv = override(
             argv,
