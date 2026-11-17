@@ -215,6 +215,8 @@ Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) f
 - [Krzysztof Wróbel](https://github.com/djstrong) — Bielik One decision models, inference engine, calibration, serving tools and tests.
 - [Filip Reka](https://github.com/FIlipHand) — original vLLM middleware integration, serving chat and typed decisions through one API server.
 
+- [Grzegorz Brzezinka](https://github.com/agentGreg) — Apple-silicon (MLX) backend for adapter packages ([#5](https://github.com/speakleash/bielik-one/pull/5)) and opt-in deterministic calendar and number facts ([#6](https://github.com/speakleash/bielik-one/pull/6)).
+
 Thank you to everyone who contributes code, reports issues and helps improve Bielik One.
 
 ## License
