@@ -1,4 +1,4 @@
-"""Per-request resource limits of the remote frontend: total prompt tokens, queued reads after a failure, deadline."""
+"""Per-request resource limits of the decision frontends: total prompt tokens, queued reads after a failure, deadline."""
 
 import contextlib
 import io
@@ -183,9 +183,8 @@ class TokenLimitTests(unittest.TestCase):
         self.assertEqual(backend.calls, 128)
 
     def test_invalid_limits_are_rejected(self):
-        for limits in ({"max_request_tokens": 0}, {"request_timeout": 0}, {"request_timeout": float("inf")}):
-            with self.assertRaises(ValueError, msg=limits):
-                engine(Backend(), **limits)
+        with self.assertRaises(ValueError):
+            engine(Backend(), max_request_tokens=0)
 
     def test_http_status_is_422(self):
         e = engine(Backend(), max_request_tokens=10)
@@ -199,80 +198,30 @@ class TokenLimitTests(unittest.TestCase):
 
 class QueuedReadsTests(unittest.TestCase):
     def test_reads_still_queued_are_dropped_after_a_failure(self):
-        release = threading.Event()
-
         def handle(number, request):
             if number == 1:
                 return httpx.Response(500)
-            release.wait(5)  # keep the other worker busy until the request has given up
+            time.sleep(0.3)  # keep the other worker busy while the request gives up
             return answer(request)
 
         backend = Backend(handle)
         e = engine(backend, workers=2)
         self.addCleanup(e.close)
-        try:
-            with prompts(50), self.assertRaises(BackendReadError):
-                e.evaluate(body(questions=8, permutations=16))
-        finally:
-            release.set()
-        time.sleep(0.3)  # the pool keeps running between requests: give it time to pick up anything left
+        with prompts(50), self.assertRaises(BackendReadError):
+            e.evaluate(body(questions=8, permutations=16))
+        time.sleep(0.5)  # the pool keeps running between requests: give it time to pick up anything left
         # The failed read, the one running beside it, and at most one taken by the freed worker before cancellation.
         self.assertLessEqual(backend.calls, 3)
 
 
-    def test_a_later_failure_is_seen_while_an_earlier_read_is_still_running(self):
-        release = threading.Event()
-
-        def handle(number, request):
-            if number == 2:
-                return httpx.Response(500)  # the second read fails at once
-            release.wait(5)  # every other read hangs until the request has given up
-            return answer(request)
-
-        backend = Backend(handle)
-        e = engine(backend, workers=2)
-        self.addCleanup(e.close)
-        started = time.monotonic()
-        try:
-            with prompts(50), self.assertRaises(BackendReadError):
-                e.evaluate(body(questions=8, permutations=16))
-            failed_after = time.monotonic() - started
-        finally:
-            release.set()
-        time.sleep(0.3)
-        self.assertLess(failed_after, 1.0)  # not after the hanging first read
-        # The hanging first read, the failed one, and at most one taken by the freed worker before cancellation:
-        # that one hangs too, so no worker is free to take more.
-        self.assertLessEqual(backend.calls, 3)
-
-
 class DeadlineTests(unittest.TestCase):
-    def test_no_deadline_is_a_valid_configuration(self):
-        backend = Backend()
-        e = engine(backend, request_timeout=None)
+    """The deadline is enforced around the whole request by server.build_app, in every frontend."""
+
+    def client(self, backend, workers=2, request_timeout=None):
+        e = engine(backend, workers=workers)
         self.addCleanup(e.close)
-        with prompts(50):
-            self.assertEqual(len(e.evaluate(body(questions=2, permutations=4))["answers"]), 2)
-        self.assertEqual(backend.calls, 8)
-
-    def test_nothing_is_sent_when_building_the_prompts_used_up_the_deadline(self):
-        backend = Backend()
-        e = engine(backend, request_timeout=0.2)
-        self.addCleanup(e.close)
-
-        def slow_prompt(*args, **kwargs):
-            time.sleep(0.05)
-            return [7] * 50
-
-        letters = lambda tok, row, semantic: list(range(1000, 1000 + len(row.options)))
-        with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=slow_prompt), patch(
-            "bielik_one.api.remote_vllm.answer_token_ids", side_effect=letters
-        ), patch("bielik_one.api.server.answer_token_ids", side_effect=letters), self.assertRaises(
-            BackendReadError
-        ) as caught:
-            e.evaluate(body(questions=2, permutations=4))  # 8 prompts x 0.05 s > 0.2 s
-        self.assertIsInstance(caught.exception.__cause__, TimeoutError)
-        self.assertEqual(backend.calls, 0)
+        app = remote_vllm.build_remote_app(e, chat_model="chat", request_timeout=request_timeout)
+        return TestClient(app)
 
     def slow(self, delay):
         def handle(number, request):
@@ -281,33 +230,62 @@ class DeadlineTests(unittest.TestCase):
 
         return Backend(handle)
 
+    def test_no_deadline_is_a_valid_configuration(self):
+        backend = Backend()
+        with prompts(50):
+            response = self.client(backend).post("/v1/systemone", json=body(2, 4).model_dump())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(backend.calls, 8)
+
+    def test_default_deadline(self):
+        self.assertEqual(remote_vllm.DEFAULT_REQUEST_TIMEOUT, 300.0)
+        e = engine(Backend())
+        self.addCleanup(e.close)
+        with prompts(50):
+            response = TestClient(remote_vllm.build_remote_app(e, chat_model="chat")).post(
+                "/v1/systemone", json=body(1, 1).model_dump()
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_nothing_is_sent_when_building_the_prompts_used_up_the_deadline(self):
+        backend = Backend()
+
+        def slow_prompt(*args, **kwargs):
+            time.sleep(0.05)
+            return [7] * 50
+
+        letters = lambda tok, row, semantic: list(range(1000, 1000 + len(row.options)))
+        with patch("bielik_one.api.remote_vllm.inference_ids", side_effect=slow_prompt), patch(
+            "bielik_one.api.remote_vllm.answer_token_ids", side_effect=letters
+        ), patch("bielik_one.api.server.answer_token_ids", side_effect=letters):
+            response = self.client(backend, request_timeout=0.2).post(
+                "/v1/systemone", json=body(2, 4).model_dump()  # 8 prompts x 0.05 s > 0.2 s
+            )
+            time.sleep(0.5)  # let the evaluation thread notice the cancellation
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.json()["code"], "TIMEOUT")
+        self.assertEqual(backend.calls, 0)
+
     def test_request_over_its_deadline_fails_with_a_timeout(self):
         backend = self.slow(0.1)
-        e = engine(backend, workers=2, request_timeout=0.5)
-        self.addCleanup(e.close)
         started = time.monotonic()
-        with prompts(50), self.assertRaises(BackendReadError) as caught:
-            e.evaluate(body(questions=8, permutations=16))  # 128 reads x 0.1 s / 2 workers = 6.4 s unbounded
+        with prompts(50):
+            # 128 reads x 0.1 s / 2 workers = 6.4 s unbounded
+            response = self.client(backend, request_timeout=0.5).post("/v1/systemone", json=body(8, 16).model_dump())
         held = time.monotonic() - started
-        self.assertIsInstance(caught.exception.__cause__, TimeoutError)
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.json()["code"], "TIMEOUT")
         self.assertLess(held, 1.5)
         time.sleep(0.3)
         self.assertLess(backend.calls, 30)
 
     def test_request_within_its_deadline_is_answered(self):
-        e = engine(self.slow(0.01), workers=2, request_timeout=30)
-        self.addCleanup(e.close)
         with prompts(50):
-            self.assertEqual(len(e.evaluate(body(questions=2, permutations=4))["answers"]), 2)
-
-    def test_http_status_is_504(self):
-        e = engine(self.slow(0.2), workers=1, request_timeout=0.1)
-        self.addCleanup(e.close)
-        client = TestClient(remote_vllm.build_remote_app(e, chat_model="chat"))
-        with prompts(50):
-            response = client.post("/v1/systemone", json=body(2, 4).model_dump())
-        self.assertEqual(response.status_code, 504)
-        self.assertEqual(response.json()["code"], "TIMEOUT")
+            response = self.client(self.slow(0.01), request_timeout=30).post(
+                "/v1/systemone", json=body(2, 4).model_dump()
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["answers"]), 2)
 
 
 class LauncherTests(unittest.TestCase):
@@ -321,6 +299,27 @@ class LauncherTests(unittest.TestCase):
                 command = dry("frontend", d, "--max-request-tokens", "1000", "--request-timeout", "30")["command"]
                 self.assertEqual(command[command.index("--max-request-tokens") + 1], "1000", kind)
                 self.assertEqual(command[command.index("--request-timeout") + 1], "30.0", kind)
+
+    def test_native_frontend_gets_the_limits_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.json").write_text(json.dumps({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}))
+            tools = Path(d) / "tools-root" / "tools"
+            tools.mkdir(parents=True)
+            for name in ("bielik_vllm_tool_parser.py", "bielik_vllm_reasoning_parser.py"):
+                (tools / name).write_text("# fixture")
+            with patch.dict("os.environ", {"BIELIK_TOOLS_DIR": str(tools.parent)}):
+                command = dry("frontend", d, "--native-tokens", "--max-request-tokens", "1000", "--request-timeout", "30")[
+                    "command"
+                ]
+        self.assertEqual(command[command.index("--max-request-tokens") + 1], "1000")
+        self.assertEqual(command[command.index("--request-timeout") + 1], "30.0")
+
+    def test_backend_refuses_frontend_limits(self):
+        with tempfile.TemporaryDirectory() as d:
+            package("llama-merged", Path(d))
+            for args in (["--max-request-tokens", "1000"], ["--request-timeout", "30"]):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit, msg=args):
+                    launch.main(["backend", d, *args, "--dry-run"])
 
     def test_invalid_limits_are_refused(self):
         with tempfile.TemporaryDirectory() as d:

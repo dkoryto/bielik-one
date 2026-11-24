@@ -134,7 +134,6 @@ def main():
         calibration=table,
         calibration_source=source,
         max_request_tokens=a.max_request_tokens,
-        request_timeout=a.request_timeout,
     )
     # Reasoning must use the same chat-token mask as ordinary chat, not the
     # unmasked raw backend. FastAPI evaluation runs outside the event loop.
@@ -145,7 +144,9 @@ def main():
         f"http://{own}:{a.port}/v1", a.base_model, tok=getattr(engine, "tok", None)
     )
     app = MaskChatTokens(
-        build_remote_app(engine, chat_model=a.base_model, error_format=a.error_format),
+        build_remote_app(
+            engine, chat_model=a.base_model, error_format=a.error_format, request_timeout=a.request_timeout
+        ),
         meta["chat_blocked_tokens"],
     )
     uvicorn.run(guarded(app, a.max_body_mb, a.error_format), host=a.host, port=a.port)

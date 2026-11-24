@@ -80,7 +80,18 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
             startup.append("shutdown")
 
     app = FastAPI(lifespan=lifespan, root_path=root_path)
-    app.state.args = SimpleNamespace(api_key=list(keys), api_server_count=server_count)
+    app.state.args = SimpleNamespace(api_key=list(keys), api_server_count=server_count,
+        enable_auto_tool_choice=True,tool_call_parser="bielik",reasoning_parser="bielik")
+    if settings.get('mode')=='native':
+        settings.setdefault('package',Path('/original-model'))
+        app.state.vllm_config=SimpleNamespace(model_config=SimpleNamespace(
+            model=str(settings['package']),tokenizer=str(settings['package']),
+            dtype='bfloat16',quantization=None,max_model_len=32768,
+            logprobs_mode='raw_logprobs',max_logprobs=128))
+        app.state.engine_healthy=True
+        async def native_backend_health():
+            return JSONResponse({'status':'ok'},200 if app.state.engine_healthy else 503)
+        app.add_api_route('/health',native_backend_health,methods=['GET'])
     cards = cards if cards is not None else [
         {"id": "base-a", "parent": None},
         {"id": "base-b", "parent": None},
@@ -148,6 +159,110 @@ def decision(model="base-a", kind="choice"):
     return {"model": model, "state": "Context", "questions": {
         "q": {"type": kind, "instructions": "Question?", "criteria": criteria}
     }}
+
+
+class NativeEngine(Engine):
+    def __init__(self):
+        super().__init__()
+        self.readout=SimpleNamespace(url='http://unbound',model='unbound',client=self.client)
+        self.temperatures={}
+        self.calibration_source=None
+
+
+def test_native_middleware_single_server_alias_auth_and_internal_filters():
+    app,owner,engine,_=make_app(mode='native',engine=NativeEngine(),keys=['secret'],
+        cards=[{'id':'decision','parent':None}],native_route=True)
+    headers={'Authorization':'Bearer secret'}
+    with TestClient(app) as client:
+        assert client.post('/v1/systemone',json=decision('decision')).status_code==401
+        models=client.get('/v1/models',headers=headers)
+        assert models.json()['data']==[{'id':'decision','parent':None}]
+        response=client.post('/v1/systemone',headers=headers,json=decision('decision'))
+        assert response.status_code==200 and response.json()['model']=='decision'
+        assert engine.readout.url=='http://testserver:80' and engine.readout.model=='decision'
+        health=client.get('/v1/systemone/health',headers=headers)
+        assert health.status_code==200 and health.json()['calibrated'] is False
+        public=client.post('/v1/chat/completions',headers=headers,
+            json={'model':'decision','vllm_xargs':{'systemone_head':'base'}})
+        assert public.status_code==200 and public.json()['received']=={'model':'decision'}
+        assert client.post('/v1/load_lora_adapter',headers=headers,json={}).status_code==403
+    assert engine.closed==1
+
+
+@pytest.mark.parametrize('field,value,message',[
+    ('enable_lora',True,'without LoRA'),('quantization','awq','BF16 or FP8'),
+    ('dtype','float16','requires BF16'),('logprobs_mode','processed_logprobs','raw_logprobs'),
+    ('max_logprobs',20,'max-logprobs'),
+])
+def test_native_middleware_rejects_incompatible_backend(field,value,message):
+    app,_,engine,_=make_app(mode='native',engine=NativeEngine(),cards=[{'id':'base-a','parent':None}])
+    setattr(app.state.args,field,value)
+    with pytest.raises(RuntimeError,match=message):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_native_middleware_adopts_actual_context_and_refuses_adapters():
+    app,_,engine,_=make_app(mode='native',engine=NativeEngine())
+    app.state.args.max_model_len=4096
+    app.state.vllm_config.model_config.max_model_len=4096
+    with TestClient(app) as client:
+        assert engine.max_model_len==4096
+        response=client.get('/v1/systemone/health')
+        assert response.status_code==503 and 'without adapters' in response.text
+
+
+def test_native_middleware_rejects_resolved_lora_without_cli_flag():
+    app,_,engine,_=make_app(mode='native',engine=NativeEngine())
+    app.state.vllm_config.lora_config=SimpleNamespace(max_lora_rank=128)
+    with pytest.raises(RuntimeError,match='without LoRA'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_native_middleware_readiness_detects_dead_engine_even_with_model_card():
+    app,_,_,_=make_app(mode='native',engine=NativeEngine(),cards=[{'id':'base-a','parent':None}])
+    with TestClient(app) as client:
+        assert client.get('/v1/systemone/health').status_code==200
+        app.state.engine_healthy=False
+        assert client.get('/v1/systemone/health').status_code==503
+
+
+def test_native_middleware_rejects_wrong_tokenizer_before_serving():
+    app,_,engine,_=make_app(mode='native',engine=NativeEngine())
+    app.state.vllm_config.model_config.tokenizer='/different-tokenizer'
+    with pytest.raises(RuntimeError,match='must match SYSTEMONE_PACKAGE'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_native_middleware_processing_deadline_is_active():
+    import time
+    engine=NativeEngine();evaluate=engine.evaluate
+    def slow(body):time.sleep(.1);return evaluate(body)
+    engine.evaluate=slow
+    app,_,_,_=make_app(mode='native',engine=engine,request_timeout=.01,
+                       cards=[{'id':'base-a','parent':None}])
+    with TestClient(app) as client:
+        assert client.post('/v1/systemone',json=decision()).status_code==504
+
+
+def test_native_engine_uses_original_token_reader_and_internal_auth(tmp_path,monkeypatch):
+    from test_base_tokens import Tok
+    from bielik_one.api.base_tokens import BaseTokenEngine,VllmTokenReadout
+    (tmp_path/'config.json').write_text(json.dumps({'model_type':'llama','architectures':['LlamaForCausalLM']}))
+    monkeypatch.delenv('SYSTEMONE_HEADS_MANIFEST',raising=False)
+    monkeypatch.setattr('transformers.AutoTokenizer.from_pretrained',lambda *a,**k:Tok())
+    settings=middleware.Settings.from_env({'SYSTEMONE_MODE':'native','SYSTEMONE_PACKAGE':str(tmp_path),
+        'SYSTEMONE_DECISION_PREFIX':'plain','VLLM_API_KEY':'secret','SYSTEMONE_INTERNAL_TOKEN':'internal'})
+    engine=middleware.build_engine(settings)
+    try:
+        assert isinstance(engine,BaseTokenEngine) and isinstance(engine.readout,VllmTokenReadout)
+        assert engine.empty_think is False and engine.temperatures=={} and engine.aliases==set()
+        assert engine.client is engine.readout.client
+        assert engine.client.headers[middleware.INTERNAL_HEADER]=='internal'
+        assert engine.client.headers['Authorization']=='Bearer secret'
+    finally:engine.close()
 
 
 @pytest.mark.parametrize("content_type", [None, "application/json", "Application/JSON", "application/problem+json"])
@@ -596,3 +711,104 @@ def test_request_limits_from_env():
 def test_invalid_request_limits_are_rejected(name, value):
     with pytest.raises(RuntimeError, match=name):
         middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package", name: value})
+
+
+@pytest.mark.parametrize('quantization', ['fp8', 'fp8_per_tensor'])
+def test_native_middleware_accepts_fp8(quantization):
+    app,_,engine,_=make_app(mode='native',engine=NativeEngine())
+    app.state.args.quantization=quantization
+    app.state.vllm_config.model_config.quantization=quantization
+    with TestClient(app):
+        assert engine.max_model_len==32768
+
+
+
+
+def test_native_middleware_accepts_prequantized_fp8_only():
+    import copy
+    cfg={'format':'float-quantized','config_groups':{'fp8':{
+        'weights':{'num_bits':8,'type':'float'},'input_activations':{'num_bits':8,'type':'float','dynamic':True}}}}
+    model=SimpleNamespace(hf_config=SimpleNamespace(quantization_config=cfg))
+    assert middleware.native_quantization_supported('compressed-tensors',model)
+    for bits,kind in [(4,'float'),(8,'int')]:
+        bad=copy.deepcopy(cfg);bad['config_groups']['fp8']['weights'].update(num_bits=bits,type=kind)
+        assert not middleware.native_quantization_supported('compressed-tensors',SimpleNamespace(hf_config=SimpleNamespace(quantization_config=bad)))
+    app,_,engine,_=make_app(mode='native',engine=NativeEngine())
+    app.state.args.quantization='compressed-tensors'
+    app.state.vllm_config.model_config.quantization='compressed-tensors'
+    app.state.vllm_config.model_config.hf_config=model.hf_config
+    with TestClient(app):
+        assert engine.max_model_len==32768
+
+
+@pytest.mark.parametrize('disabled,explicit',[(False,False),(True,False),(False,True)])
+def test_native_middleware_loads_model_calibration(tmp_path,monkeypatch,disabled,explicit):
+    from transformers import AutoTokenizer
+    from test_base_tokens import Tok
+    monkeypatch.delenv('SYSTEMONE_HEADS_MANIFEST',raising=False)
+    monkeypatch.setattr(AutoTokenizer,'from_pretrained',lambda *a,**kw:Tok())
+    (tmp_path/'config.json').write_text(json.dumps({'model_type':'llama','architectures':['LlamaForCausalLM']}))
+    default=tmp_path/'calibration.json';custom=tmp_path/'custom.json'
+    for path,t in [(default,2),(custom,3)]:
+        path.write_text(json.dumps({'temperatures':dict(choice=t,binary=t,score=t,labels=t)}))
+    settings=middleware.Settings(package=tmp_path,mode='native',calibration=not disabled,
+                                 native_calibration=str(custom) if explicit else None)
+    engine=middleware.build_engine(settings)
+    try:
+        if disabled:
+            assert engine.temperatures=={} and engine.calibration_source is None
+        else:
+            assert engine.temperatures['1']['labels']==(3 if explicit else 2)
+            assert engine.calibration_source==str(custom if explicit else default)
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize('mode',['native','adapter'])
+@pytest.mark.parametrize('missing',['tool_call_parser','reasoning_parser','enable_auto_tool_choice'])
+def test_middleware_requires_chat_parsers_at_startup(mode,missing):
+    app,owner,engine,_=make_app(mode=mode)
+    engine.chat_parser_profile='bielik'
+    setattr(app.state.args,missing,False if missing=='enable_auto_tool_choice' else None)
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_middleware_validates_effective_reasoning_configuration():
+    app,owner,engine,_=make_app(mode='native')
+    app.state.vllm_config.structured_outputs_config=SimpleNamespace(reasoning_parser=None)
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_qwen_middleware_checks_matching_parser_pair():
+    app,owner,engine,_=make_app()
+    engine.chat_parser_profile='qwen'
+    app.state.args.tool_call_parser='qwen3_coder'
+    app.state.args.reasoning_parser='qwen3'
+    with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_injected_engine_does_not_bypass_required_chat_parsers():
+    app,owner,engine,_=make_app()
+    app.state.args.tool_call_parser=None
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+@pytest.mark.parametrize('profile,wrong_tool,wrong_reasoning',[
+    ('bielik','qwen3_coder','qwen3'),('qwen','bielik','bielik')])
+def test_middleware_rejects_wrong_nonempty_effective_parser_pair(profile,wrong_tool,wrong_reasoning):
+    app,owner,engine,_=make_app()
+    engine.chat_parser_profile=profile
+    app.state.args.tool_call_parser=wrong_tool
+    app.state.args.reasoning_parser=wrong_reasoning
+    app.state.vllm_config=SimpleNamespace(
+        structured_outputs_config=SimpleNamespace(reasoning_parser=wrong_reasoning))
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1

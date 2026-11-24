@@ -9,6 +9,8 @@ a calibration temperature, if the caller sends one, is applied to that mean.
 
 from __future__ import annotations
 
+from fastapi import Request
+
 import json
 import math
 import random
@@ -20,6 +22,8 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from bielik_one.api.labels_park import sigmoid_from_logprobs
+from bielik_one.prompting.facts import facts as compute_facts
+from bielik_one.prompting.facts import inject as inject_facts
 from bielik_one.prompting.intervals import at_temperature
 from bielik_one.prompting.letter import answer_token_ids
 from bielik_one.prompting.orders import _alt_orders, _reordered
@@ -36,6 +40,7 @@ KINDS = ("choice", "noul", "score")
 DEFAULT_READ_TWICE_MAX_INPUT_TOKENS = 4096
 MAX_PERMUTATIONS = 16
 MAX_QUESTIONS = 64
+CONTEXT_LIMIT = "context limit exceeded; no truncation"
 MAX_STATE_CHARS = 400_000  # well above a 32768-token context; longer prompts are rejected by the backend anyway
 MAX_QUESTIONS_CHARS = 400_000  # all question names, instructions, option names and texts together
 MAX_PROMPTS = MAX_QUESTIONS * MAX_PERMUTATIONS  # decision reads per request, after per-option expansion
@@ -108,6 +113,9 @@ class SystemOneIn(BaseModel):
         default=DEFAULT_READ_TWICE_MAX_INPUT_TOKENS, ge=0, strict=True
     )
     prompt_details: bool = False
+    # Deterministic facts (calendar and number arithmetic) computed from the state and the instructions and appended
+    # to the state before the model reads it; see bielik_one/prompting/facts.py.
+    facts: bool = False
     reasoning: Literal["off", "on", "auto"] = "off"
     reasoning_model: Literal["original"] = "original"
     reasoning_threshold: float = Field(default=0.9, ge=0, le=1, allow_inf_nan=False)
@@ -537,6 +545,12 @@ class LetterEngine:
     """Decision logic shared by the vLLM frontends. Subclasses set tok, model_name, capacity, parking,
     labels_threshold, semantic, temperatures, max_model_len and reasoners, and implement distributions()."""
 
+    def per_option_probability(self, tables, token_ids, orders, temperature, yes):
+        return score_orders(tables, token_ids, orders, temperature)[yes]
+
+    def per_option_temperature_kind(self, row):
+        return "noul"
+
     def _evaluate_once(
         self,
         body: SystemOneIn,
@@ -624,7 +638,7 @@ class LetterEngine:
             saved = {} if analyses else self.temperatures
             if body.questions[name].mode == "per_option":
                 # Each option is a noul decision, so it takes the noul temperature and the 0.5 noul threshold.
-                temperature = resolve_temperature(body.temperature, "noul", saved, body.permutations)
+                temperature = resolve_temperature(body.temperature, self.per_option_temperature_kind(row), saved, body.permutations)
                 keys, probs, raw = [], [], []
                 for key, sub_row, sub_orders in orders:
                     chunk = tables[cursor : cursor + len(sub_orders)]
@@ -635,7 +649,7 @@ class LetterEngine:
                     ]
                     yes = [option.key for option in sub_row.options].index("yes")
                     keys.append(key)
-                    probs.append(score_orders(chunk, token_ids, sub_orders, temperature)[yes])
+                    probs.append(self.per_option_probability(chunk, token_ids, sub_orders, temperature, yes))
                     if raw_confidence is not None:
                         raw.append(score_orders(chunk, token_ids, sub_orders, 1.0)[yes])
                 answers[name] = {**systemone_answer("labels", keys, probs, legend, 0.5), "mode": "per_option"}
@@ -716,6 +730,8 @@ class LetterEngine:
     reasoning_enabled = False
 
     def evaluate(self, body: SystemOneIn) -> dict[str, Any]:
+        if body.facts:
+            return self._evaluate_with_facts(body)
         if body.reasoning == "off":
             return self._evaluate_once(body)
         if not self.reasoning_enabled:
@@ -796,11 +812,35 @@ class LetterEngine:
         return result
 
 
+    def _evaluate_with_facts(self, body: SystemOneIn) -> dict[str, Any]:
+        """The request with the computed facts appended to its state; the response lists them under "facts"."""
+        state = state_text(body.state)
+        instructions = []
+        for name, question in body.questions.items():
+            instructions.append(_instructions(name, question.instructions))
+        lines, language = compute_facts(state, instructions)
+        extended = inject_facts(state, lines, language)
+        if len(extended) > MAX_STATE_CHARS:  # the facts never make a valid request invalid
+            lines, extended = [], state
+        try:
+            result = self.evaluate(body.model_copy(update={"state": extended, "facts": False}))
+        except RequestError as error:
+            # The facts count toward the read-twice threshold and the context like the rest of the state; when the
+            # standard prompt with them no longer fits the context, the request is read without them.
+            if not lines or error.msg != CONTEXT_LIMIT:
+                raise
+            lines = []
+            result = self.evaluate(body.model_copy(update={"state": state, "facts": False}))
+        result["facts"] = {"language": language, "lines": lines}
+        return result
+
+
 def answer_confidence(answer: Mapping) -> float:
     return float(answer["confidence"])
 
 
-def build_app(engine: "LetterEngine", error_format: str = "default"):
+def build_app(engine: "LetterEngine", error_format: str = "default", *,
+              max_requests: int | None = None, request_timeout: float | None = 300):
     """Typed decision endpoint for a ready engine. The vLLM frontend adds health, models and chat routes."""
     from fastapi import FastAPI, HTTPException
 
@@ -809,7 +849,6 @@ def build_app(engine: "LetterEngine", error_format: str = "default"):
     app = FastAPI(title="Bielik One decisions")
     install(app, error_format)
 
-    @app.post("/v1/systemone")
     def systemone(body: SystemOneIn) -> dict[str, Any]:
         try:
             return engine.evaluate(body)
@@ -819,4 +858,16 @@ def build_app(engine: "LetterEngine", error_format: str = "default"):
                 detail=[{"loc": exc.loc, "msg": exc.msg, "type": "value_error"}],
             ) from exc
 
+    endpoint = systemone
+    # Either bound turns on the executor: max_requests gates concurrency, request_timeout bounds each request.
+    if max_requests is not None or request_timeout is not None:
+        from fastapi import Request
+        from bielik_one.api.request_execution import RequestExecutor
+        from bielik_one.api.remote_vllm import install_backend_errors
+        install_backend_errors(app,error_format)
+        executor = RequestExecutor(max_requests,request_timeout)
+        async def bounded_systemone(body: SystemOneIn, request: Request):
+            return await executor.run(systemone,body,request)
+        endpoint = bounded_systemone
+    app.add_api_route("/v1/systemone",endpoint,methods=["POST"],response_model=dict[str, Any])
     return app

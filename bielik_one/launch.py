@@ -1,12 +1,14 @@
 """Launch the vLLM backend and the typed decision API for a downloaded Bielik One model package.
 
     bielik-one backend  PACKAGE_DIR [--fp8] [--port N] [--dry-run]
+    bielik-one backend  PACKAGE_DIR --engine mlx [--base BASE_DIR] [--port N] [--dry-run]
     bielik-one frontend PACKAGE_DIR [--no-calibration] [--port N] [--backend-url URL] [--dry-run]
 
 PACKAGE_DIR is a snapshot of one of the Bielik One Hugging Face repositories (merged or -Adapter). The package
 kind is detected from its files; each kind starts with the profile validated for that package (see its card).
 Runtime files and weights listed in SHA256SUMS.json are verified before anything starts. The frontend applies the package's
-calibration.json unless --no-calibration is given.
+calibration.json unless --no-calibration is given. `--engine mlx` starts the Apple-silicon backend of an adapter
+package instead of vLLM (bielik_one.mlx_backend); the frontend is the same.
 """
 
 from __future__ import annotations
@@ -316,6 +318,70 @@ def backend(
     return argv, {"VLLM_PLUGINS": "", "VLLM_MAX_NUM_BAD_WORDS": "2048"}
 
 
+# Chat parsers live in the upstream bielik-tools checkout, independently of
+# the decision tokenizer/template pinned by the package.
+BIELIK_CHAT_MODELS = {
+    "speakleash/Bielik-11B-v3.1-Instruct": False,
+    "speakleash/Bielik-11B-v3.0-Instruct": True,
+    "speakleash/Bielik-Minitron-7B-v3.0-Instruct": True,
+}
+
+
+def bielik_chat_args(root: Path, kind: str, tools_dir: str | None = None) -> list[str]:
+    """Required chat setup from one external bielik-tools checkout."""
+    if kind == "native-tokens":
+        # Original Bielik 3.2 already supplies its chat template.
+        advanced_template = False
+    else:
+        if kind != "llama-adapter":
+            raise ValueError("--bielik-tools-dir supports Bielik adapter or native packages only")
+        model = json.loads((root / "serving.json").read_text())["base_model"]
+        if model not in BIELIK_CHAT_MODELS:
+            raise ValueError(f"--bielik-tools-dir: unsupported base model {model!r}")
+        advanced_template = BIELIK_CHAT_MODELS[model]
+    if not tools_dir:
+        raise ValueError("Bielik tool and reasoning parsers are required: set BIELIK_TOOLS_DIR or --bielik-tools-dir to a trusted bielik-tools checkout")
+    tools = Path(tools_dir).expanduser().resolve() / "tools"
+    tool_parser = tools / "bielik_vllm_tool_parser.py"
+    reasoning_parser = tools / "bielik_vllm_reasoning_parser.py"
+    template = tools / "bielik_advanced_chat_template.jinja"
+    required = [tool_parser, reasoning_parser] + ([template] if advanced_template else [])
+    for path in required:
+        if not path.is_file():
+            raise ValueError(f"Missing bielik-tools file: {path}; use a checkout supporting vLLM 0.32")
+    argv = [
+        "--enable-auto-tool-choice",
+        "--tool-parser-plugin", str(tool_parser),
+        "--tool-call-parser", "bielik",
+        "--reasoning-parser-plugin", str(reasoning_parser),
+        "--reasoning-parser", "bielik",
+        "--exclude-tools-when-tool-choice-none",
+    ]
+    # Bielik 3.1 already ships its tool/reasoning template. The 3.0 models
+    # need the upstream advanced template for ordinary chat, not for decisions.
+    if advanced_template:
+        argv += ["--chat-template", str(template)]
+    return argv
+
+
+def chat_tools_dir(args):
+    if args.no_bielik_chat_parsers:
+        raise ValueError("Chat tool and reasoning parsers are required; --no-bielik-chat-parsers is no longer supported")
+    return args.bielik_tools_dir if args.bielik_tools_dir is not None else os.environ.get("BIELIK_TOOLS_DIR")
+
+
+def required_chat_args(root: Path, kind: str, args) -> list[str]:
+    tools_dir = chat_tools_dir(args)
+    if kind in ("llama-adapter", "native-tokens"):
+        return bielik_chat_args(root, kind, tools_dir)
+    if args.bielik_tools_dir is not None:
+        return bielik_chat_args(root, kind, tools_dir)  # Reject explicit Bielik overrides on other model types.
+    if kind == "qwen-adapter":
+        return ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",
+                "--reasoning-parser", "qwen3", "--exclude-tools-when-tool-choice-none"]
+    return []
+
+
 def frontend(
     root: Path,
     kind: str,
@@ -386,6 +452,30 @@ def frontend(
     ] + calibration_args(root, no_calibration)
 
 
+def mlx_backend(
+    root: Path,
+    kind: str,
+    host: str,
+    port: int,
+    base: str | None,
+    cache_limit_gb: float | None,
+    skip_base_check: bool,
+) -> tuple[list[str], dict]:
+    """The Apple-silicon backend (bielik_one.mlx_backend): adapter packages only, base model loaded once."""
+    if kind not in ("llama-adapter", "qwen-adapter"):
+        raise ValueError(
+            "the MLX backend serves adapter packages (*-Adapter); merged packages need vLLM"
+        )
+    argv = [sys.executable, "-m", "bielik_one.mlx_backend", str(root), "--host", host, "--port", str(port)]
+    if base is not None:
+        argv += ["--base", str(Path(base).expanduser().resolve())]
+    if cache_limit_gb is not None:
+        argv += ["--cache-limit-gb", str(cache_limit_gb)]
+    if skip_base_check:
+        argv.append("--skip-base-check")
+    return argv, {"TOKENIZERS_PARALLELISM": "false"}
+
+
 def override(argv: list[str], flag: str, value) -> list[str]:
     """Replace the value of `flag` in a built command (profile defaults stay when `value` is None)."""
     if value is None:
@@ -407,6 +497,51 @@ def connect_host(bind: str) -> str:
     return f"[{host}]" if ":" in host else host
 
 
+def native_commands(root, component, args):
+    """Explicit untouched-Llama profile; never auto-detect this for decision packages."""
+    if args.engine != "vllm":
+        raise ValueError("--native-tokens currently requires --engine vllm")
+    cfg = json.loads((root / "config.json").read_text())
+    if cfg.get("model_type") != "llama" or cfg.get("architectures") != ["LlamaForCausalLM"]:
+        raise ValueError("native tokens require an original LlamaForCausalLM checkpoint")
+    if any((root / name).exists() for name in ("conversion.json", "heads.json", "adapter_config.json")):
+        raise ValueError("native tokens require original weights, not a decision package or adapter")
+    if component == "backend":
+        command = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", str(root),
+                   "--served-model-name", "base", "--host", args.backend_host,
+                   "--port", str(args.port or 8025), "--dtype", "bfloat16",
+                   "--max-model-len", "32768", "--max-logprobs", "128",
+                   "--logprobs-mode", "raw_logprobs", "--enable-prefix-caching",
+                   "--max-num-seqs", str(args.max_num_seqs or 8),
+                   "--max-num-batched-tokens", "2048", "--gpu-memory-utilization", "0.90"]
+        command += required_chat_args(root, "native-tokens", args)
+        if args.fp8:
+            command += FP8
+        if args.kv_cache_gb is not None:
+            command += ["--kv-cache-memory-bytes", str(int(args.kv_cache_gb * 2**30))]
+        if args.eager:
+            command += ["--enforce-eager"]
+        return command, {"VLLM_PLUGINS": ""}
+    command = [sys.executable, "-m", "bielik_one.api.base_tokens", "--base-model", str(root),
+               "--backend-url", args.backend_url or f"http://{connect_host(args.backend_host)}:8025",
+               "--backend-model", "base", "--host", args.host, "--port", str(args.port or 8026),
+               "--workers", str(args.max_num_seqs or 8), "--decision-prefix", args.decision_prefix]
+    for flag, value in [("--queue-size", args.read_queue_size), ("--max-requests", args.max_requests),
+                        ("--backend-timeout", args.backend_timeout), ("--request-timeout", args.request_timeout),
+                        ("--max-request-tokens", args.max_request_tokens)]:
+        if value is not None:
+            command += [flag, str(value)]
+    if args.no_calibration:
+        command += ["--no-calibration"]
+    if args.native_calibration is not None:
+        command += ["--calibration", str(args.native_calibration.resolve())]
+    if args.max_body_mb is not None:
+        command += ["--max-body-mb", str(args.max_body_mb)]
+    if args.error_format:
+        command += ["--error-format", args.error_format]
+    return command, {}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="bielik-one",
@@ -418,7 +553,27 @@ def main(argv=None):
         "package",
         help="model package: a Hugging Face repo id (downloaded to the HF cache) or a local directory",
     )
+    p.add_argument("--native-calibration", type=Path, help="native frontend: explicit calibration JSON (default: beside model)")
+    p.add_argument("--read-queue-size", type=int, help="native frontend: queued reads beyond the worker pool (default: 64)")
+    p.add_argument("--max-requests", type=int, help="native frontend: active processing requests (default: 32)")
+    p.add_argument("--backend-timeout", type=float, help="native frontend: backend read timeout in seconds (default: 180)")
+    p.add_argument("--request-timeout", type=float, metavar="SECONDS",
+                   help="frontend: time one decision request may take; slower ones get HTTP 504 (default: 300)")
+    p.add_argument("--native-tokens", action="store_true", help="untouched Bielik 3.2: read original answer tokens; no adapter or heads")
+    p.add_argument("--decision-prefix", choices=["empty-think", "plain"], default="empty-think", help="native tokens only: assistant suffix (default: documented empty-think contract)")
     p.add_argument("--revision", help="revision of a Hugging Face repo id (default: main)")
+    chat = p.add_mutually_exclusive_group()
+    chat.add_argument(
+        "--bielik-tools-dir",
+        metavar="DIR",
+        help="vLLM backend: required bielik-tools checkout for Bielik tool/reasoning parsers "
+        "(default: BIELIK_TOOLS_DIR); no parser files are copied or downloaded",
+    )
+    chat.add_argument(
+        "--no-bielik-chat-parsers",
+        action="store_true",
+        help="removed: tool and reasoning parsers are required for adapter/native vLLM serving",
+    )
     p.add_argument(
         "--host",
         default="127.0.0.1",
@@ -455,6 +610,29 @@ def main(argv=None):
         help="backend without CUDA graphs (shorter start, slower chat generation; decisions are unchanged)",
     )
     p.add_argument(
+        "--engine",
+        choices=["vllm", "mlx"],
+        default="vllm",
+        help="backend engine: vllm (NVIDIA GPU, default) or mlx (Apple silicon, adapter packages; "
+        "pip install 'bielik-one[mlx]')",
+    )
+    p.add_argument(
+        "--base",
+        metavar="DIR",
+        help="--engine mlx: local base model at the revision the package pins (default: download it to the HF cache)",
+    )
+    p.add_argument(
+        "--cache-limit-gb",
+        type=float,
+        metavar="GB",
+        help="--engine mlx: MLX buffer cache limit (default: 4)",
+    )
+    p.add_argument(
+        "--skip-base-check",
+        action="store_true",
+        help="--engine mlx: do not check the base model against the Hub's checksums of the pinned revision",
+    )
+    p.add_argument(
         "--max-body-mb",
         type=float,
         metavar="MB",
@@ -466,12 +644,6 @@ def main(argv=None):
         metavar="N",
         help="frontend: prompt tokens one decision request may send in all; larger ones get HTTP 422 "
         "(default: 4194304)",
-    )
-    p.add_argument(
-        "--request-timeout",
-        type=float,
-        metavar="SECONDS",
-        help="frontend: time one decision request may spend on its reads; slower ones get HTTP 504 (default: 600)",
     )
     p.add_argument(
         "--error-format",
@@ -495,11 +667,31 @@ def main(argv=None):
         "without starting it, to run vLLM yourself; see README, 'Running vLLM yourself'",
     )
     a = p.parse_args(argv)
+    if (a.bielik_tools_dir is not None or a.no_bielik_chat_parsers) and (
+        a.component != "backend" or a.engine != "vllm"
+    ):
+        p.error("--bielik-tools-dir and --no-bielik-chat-parsers are vLLM backend options")
     if a.shell and a.component != "backend":
         p.error(
             "--shell prints the vLLM backend command; start the API with "
             "'bielik-one frontend <package> --backend-url http://<host>:<port>'"
         )
+    def given(pairs):
+        return [flag for flag, value in pairs if value not in (None, False)]
+
+    mlx_only = given(
+        [("--base", a.base), ("--cache-limit-gb", a.cache_limit_gb), ("--skip-base-check", a.skip_base_check)]
+    )
+    if mlx_only and (a.engine != "mlx" or a.component != "backend"):
+        p.error(f"{', '.join(mlx_only)}: options of 'bielik-one backend <package> --engine mlx'")
+    if a.engine == "mlx" and a.component == "backend":
+        vllm_only = given(
+            [("--fp8", a.fp8), ("--eager", a.eager), ("--max-num-seqs", a.max_num_seqs), ("--kv-cache-gb", a.kv_cache_gb)]
+        )
+        if vllm_only:
+            p.error(f"{', '.join(vllm_only)}: vLLM options, not used by --engine mlx")
+        if a.cache_limit_gb is not None and not (math.isfinite(a.cache_limit_gb) and a.cache_limit_gb > 0):
+            p.error("--cache-limit-gb must be positive")
     if a.max_num_seqs is not None and not 1 <= a.max_num_seqs <= 256:
         p.error("--max-num-seqs must be between 1 and 256")
     if a.kv_cache_gb is not None and not a.kv_cache_gb > 0:
@@ -510,10 +702,42 @@ def main(argv=None):
         p.error("--max-request-tokens must be at least 1")
     if a.request_timeout is not None and not (math.isfinite(a.request_timeout) and a.request_timeout > 0):
         p.error("--request-timeout must be a finite number of seconds greater than 0")
+    if (a.max_request_tokens is not None or a.request_timeout is not None) and a.component != "frontend":
+        p.error("--max-request-tokens and --request-timeout apply only to the frontend")
+    if a.native_calibration is not None and (not a.native_tokens or a.component != "frontend"):
+        p.error("--native-calibration applies only to frontend --native-tokens")
+    if a.native_calibration is not None and a.no_calibration:
+        p.error("--native-calibration conflicts with --no-calibration")
+    limits = (a.read_queue_size, a.max_requests, a.backend_timeout)
+    if any(v is not None for v in limits) and (not a.native_tokens or a.component != "frontend"):
+        p.error("native request limits apply only to 'frontend --native-tokens'")
+    if a.read_queue_size is not None and not 0 <= a.read_queue_size <= 4096:
+        p.error("--read-queue-size must be between 0 and 4096")
+    if a.max_requests is not None and not 1 <= a.max_requests <= 256:
+        p.error("--max-requests must be between 1 and 256")
+    if a.backend_timeout is not None and (not math.isfinite(a.backend_timeout) or a.backend_timeout <= 0):
+        p.error("native timeouts must be finite and positive")
     try:
         root = resolve_package(a.package, a.revision)
     except ValueError as exc:
         p.error(str(exc))
+    if a.native_tokens:
+        if a.component == "backend" and a.host not in LOOPBACK:
+            p.error("--host sets the frontend address; use --backend-host to bind the raw vLLM backend")
+        try:
+            command, extra = native_commands(root, a.component, a)
+        except (ValueError, FileNotFoundError) as exc:
+            p.error(str(exc))
+        launch_env = {**LAUNCH_ENV, **extra}
+        if a.shell:
+            print(shlex.join(["env", *(f"{k}={v}" for k,v in launch_env.items()), *command]))
+        elif a.dry_run:
+            print(json.dumps({"kind":"native-tokens", "command":command, "env":launch_env, "checksums_verified":False}, indent=2))
+        else:
+            os.execvpe(command[0], command, {**os.environ, **launch_env})
+        return 0
+    if a.decision_prefix != "empty-think":
+        p.error("--decision-prefix applies only to --native-tokens")
     try:
         verify(root)
         kind = detect(root)
@@ -525,9 +749,22 @@ def main(argv=None):
             p.error(
                 "--host sets the frontend address; use --backend-host to bind the raw vLLM backend"
             )
+    mlx = a.component == "backend" and a.engine == "mlx"
+    if mlx:
+        try:
+            argv, extra = mlx_backend(
+                root, kind, a.backend_host, a.port or back_port, a.base, a.cache_limit_gb, a.skip_base_check
+            )
+        except ValueError as exc:
+            p.error(f"{root}: {exc}")
+    elif a.component == "backend":
         argv, extra = backend(
             root, kind, a.backend_host, a.port or back_port, a.fp8, a.eager
         )
+        try:
+            argv += required_chat_args(root, kind, a)
+        except ValueError as exc:
+            p.error(str(exc))
         argv = override(argv, "--max-num-seqs", a.max_num_seqs)
         argv = override(
             argv,
@@ -559,7 +796,8 @@ def main(argv=None):
         if a.max_num_seqs:
             workers = argv[argv.index("--workers") + 1]
             argv = override(argv, "--workers", max(int(workers), a.max_num_seqs))
-    launch_env = {**LAUNCH_ENV, **extra}
+    # The vLLM settings in LAUNCH_ENV do not apply to the MLX backend.
+    launch_env = extra if mlx else {**LAUNCH_ENV, **extra}
     if a.shell:
         print(shlex.join(["env", *(f"{k}={v}" for k, v in launch_env.items()), *argv]))
         return 0
