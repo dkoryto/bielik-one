@@ -1,6 +1,7 @@
 """Original Bielik answer tokens: model-specific prompt and output interpretation."""
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from bielik_one.api.remote_vllm import RemoteVllmEngine, build_remote_app
 from bielik_one.api.vllm_reads import (

@@ -58,3 +58,21 @@ def test_native_backend_accepts_opt_in_fp8(tmp_path):
     cmd=dry('backend',original(tmp_path),'--native-tokens','--fp8')['command']
     assert cmd[cmd.index('--quantization')+1]=='fp8_per_tensor'
     assert json.loads(cmd[cmd.index('--quantization-config')+1])=={'ignore':['*lm_head*']}
+
+
+def test_native_frontend_cli_reaches_real_application_startup(tmp_path,monkeypatch):
+    import sys,uvicorn
+    from transformers import AutoTokenizer
+    from fastapi.testclient import TestClient
+    from test_base_tokens import Tok
+    from bielik_one.api import base_tokens
+    monkeypatch.setattr(AutoTokenizer,'from_pretrained',lambda *a,**kw:Tok())
+    monkeypatch.setattr(sys,'argv',['base_tokens','--base-model',str(tmp_path),'--backend-url','http://backend'])
+    started=[]
+    def run(app,**kwargs):
+        with TestClient(app) as client:
+            assert client.get('/openapi.json').status_code==200
+        started.append(kwargs)
+    monkeypatch.setattr(uvicorn,'run',run)
+    base_tokens.main()
+    assert started and started[0]['port']==8026
