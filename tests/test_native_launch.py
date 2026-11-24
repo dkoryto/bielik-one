@@ -58,3 +58,16 @@ def test_native_backend_accepts_opt_in_fp8(tmp_path):
     cmd=dry('backend',original(tmp_path),'--native-tokens','--fp8')['command']
     assert cmd[cmd.index('--quantization')+1]=='fp8_per_tensor'
     assert json.loads(cmd[cmd.index('--quantization-config')+1])=={'ignore':['*lm_head*']}
+
+
+def test_native_calibration_forwarding_and_disable(tmp_path):
+    root=original(tmp_path)
+    calibration=tmp_path/'custom.json';calibration.write_text('{}')
+    cmd=dry('frontend',root,'--native-tokens','--native-calibration',str(calibration))['command']
+    assert cmd[cmd.index('--calibration')+1]==str(calibration)
+    cmd=dry('frontend',root,'--native-tokens','--no-calibration')['command']
+    assert '--no-calibration' in cmd
+    with pytest.raises(ValueError,match='conflicts'):
+        dry('frontend',root,'--native-tokens','--native-calibration',str(calibration),'--no-calibration')
+    with pytest.raises(ValueError,match='only to frontend'):
+        dry('backend',root,'--native-tokens','--native-calibration',str(calibration))

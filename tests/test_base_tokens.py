@@ -168,3 +168,39 @@ def test_labels_count_is_not_limited_by_choice_token_pool():
             engine.evaluate(body.model_copy(update={'questions':{'q':QuestionIn(type='choice',instructions='Pick one',criteria={f'k{i}':str(i) for i in range(129)})}}))
         assert calls==[]
     finally:reader.close()
+
+
+def test_native_labels_use_separate_calibration_from_noul():
+    def backend(tasks):
+        return [{token:float(i) for i,token in enumerate(wanted)} for _,wanted in tasks]
+    engine=BaseTokenEngine(Tok(),backend)
+    engine.temperatures={'1':{'labels':2,'noul':1}}
+    body=SystemOneIn(model='decision',state='s',read_twice=True,read_twice_max_input_tokens=None,
+        questions={'tags':QuestionIn(type='labels',instructions='Select',criteria={'a':'apple','b':'pear'}),
+                   'binary':QuestionIn(type='noul',instructions='Present?')})
+    result=engine.evaluate(body)['answers']
+    assert result['tags']['probabilities']['a']==pytest.approx(1/(1+math.exp(-.5)))
+    assert result['binary']['noul']==pytest.approx(1/(1+math.exp(-1)))
+
+
+def test_native_calibration_applies_across_request_variants(tmp_path):
+    import json
+    path=tmp_path/'calibration.json'
+    value={'temperatures':{'choice':2,'binary':3,'score':4,'labels':5},
+           'configuration':{'read_twice':True,'read_twice_max_input_tokens':None,
+                            'permutations':1,'decision_prefix':'empty-think','precision':'bf16'}}
+    path.write_text(json.dumps(value))
+    def backend(tasks):
+        return [{token:float(i) for i,token in enumerate(wanted)} for _,wanted in tasks]
+    for prefix in [True,False]:
+        engine=BaseTokenEngine(Tok(),backend,empty_think=prefix)
+        engine.load_calibration(path)
+        assert engine.temperatures['1']['labels']==5
+        for rt,permutations,qbs in [(False,1,False),(True,1,False),(True,2,False),(False,1,True)]:
+            result=engine.evaluate(SystemOneIn(model='decision',state='s',read_twice=rt,
+                permutations=permutations,questions_before_state=qbs,
+                questions={'q':QuestionIn(type='noul',instructions='Present?')}))
+            assert result['answers']['q']['type']=='noul'
+    value['complete_validation_collection']=False;path.write_text(json.dumps(value))
+    with pytest.raises(ValueError,match='provisional'):
+        engine.load_calibration(path)

@@ -266,7 +266,7 @@ normalized together. Usage counts every physical chunk prompt. Noul reads `no`
 and `yes`; score reads the digits of ordered levels. Labels always expand to
 independent noul questions, retaining the labels response format and a 0.5
 threshold. Label probabilities need not sum to one and the selected set may be
-empty. These probabilities are uncalibrated in this native profile.
+empty. These probabilities are uncalibrated unless the model provides calibration.json.
 
 Native decisions use the supplied instructions in ChatML without a general-chat
 preamble. The default assistant suffix is `<think></think>`; frontend option
@@ -332,3 +332,39 @@ Native processing bounds use `SYSTEMONE_WORKERS` (8),
 (300 seconds). These reuse the frontend's bounded pool, overload errors,
 deadlines and cooperative cancellation. The actual vLLM context limit is
 reflected in prompt metadata and context errors.
+
+#### Native calibration
+
+Store model-specific `calibration.json` beside the original checkpoint's
+`config.json`. The native frontend and native middleware load it automatically.
+The library contains no hard-coded model temperatures. Without the file,
+probabilities remain uncalibrated. Invalid or explicitly incomplete calibration
+files fail startup instead of silently falling back.
+
+A single table applies to **all inference variants**: standard and read twice,
+read-twice thresholds, both decision prefixes, questions before state, option
+permutations, and BF16 or opt-in FP8. Fitting configuration records provenance,
+not inference restrictions. This policy does not establish equal calibration
+quality for every variant. Explicit request `temperature` overrides saved values.
+Labels expanded to noul use their own `labels` temperature; ordinary noul uses
+`binary`. Existing adapter and merged-package calibration behavior is unchanged.
+
+For an explicit frontend file:
+
+```bash
+bielik-one frontend /path/to/bielik-3.2 --native-tokens \
+  --native-calibration /path/to/calibration.json
+```
+
+Use `--no-calibration` to disable loading. With native middleware, set
+`SYSTEMONE_NATIVE_CALIBRATION=/path/to/calibration.json` for an explicit file,
+or `SYSTEMONE_NO_CALIBRATION=1` to disable loading. Explicit files combined with
+disabled calibration are rejected. Health reports `calibrated` and `calibration`;
+these describe loaded defaults even if a request overrides the temperature.
+
+The JSON `temperatures` object must contain four positive finite numbers:
+`choice`, `binary`, `score`, and `labels`. Optional `configuration` records fitting
+provenance. `complete_validation_collection: false` marks a provisional file and
+prevents loading it. Calibration values belong with model weights, not in the
+library. Temperature scaling runs in the API on CPU without changing weights or
+requiring another model pass.

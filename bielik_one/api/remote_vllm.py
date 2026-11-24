@@ -61,6 +61,10 @@ def load_calibration(path: Path, model: str | None = None) -> dict:
     A request `temperature` still wins. `model` (the metadata source_repo) must match the file.
     """
     data = json.loads(Path(path).read_text())
+    if not isinstance(data,dict):
+        raise ValueError("calibration.json must be an object")
+    if data.get("complete_validation_collection") is False:
+        raise ValueError("Calibration is provisional: validation collection is incomplete")
     if model is not None and data.get("model") != model:
         raise ValueError(
             f"calibration.json is for {data.get('model')!r}, not for {model!r}"
@@ -129,6 +133,10 @@ def package_dir(metadata_path, wanted: str) -> Path:
 class RemoteVllmEngine(LetterEngine):
     strict_read_twice_context = False
     report_output_reads = True
+
+    def load_calibration(self,path):
+        self.temperatures=load_calibration(path)
+        self.calibration_source=str(path)
 
     def prompt_ids(self,row,**kwargs):
         return inference_ids(self.tok,row,self.semantic,**kwargs)

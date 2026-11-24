@@ -545,6 +545,12 @@ class LetterEngine:
     """Decision logic shared by the vLLM frontends. Subclasses set tok, model_name, capacity, parking,
     labels_threshold, semantic, temperatures, max_model_len and reasoners, and implement distributions()."""
 
+    def per_option_probability(self, tables, token_ids, orders, temperature, yes):
+        return score_orders(tables, token_ids, orders, temperature)[yes]
+
+    def per_option_temperature_kind(self, row):
+        return "noul"
+
     def _evaluate_once(
         self,
         body: SystemOneIn,
@@ -632,7 +638,7 @@ class LetterEngine:
             saved = {} if analyses else self.temperatures
             if body.questions[name].mode == "per_option":
                 # Each option is a noul decision, so it takes the noul temperature and the 0.5 noul threshold.
-                temperature = resolve_temperature(body.temperature, "noul", saved, body.permutations)
+                temperature = resolve_temperature(body.temperature, self.per_option_temperature_kind(row), saved, body.permutations)
                 keys, probs, raw = [], [], []
                 for key, sub_row, sub_orders in orders:
                     chunk = tables[cursor : cursor + len(sub_orders)]
@@ -643,7 +649,7 @@ class LetterEngine:
                     ]
                     yes = [option.key for option in sub_row.options].index("yes")
                     keys.append(key)
-                    probs.append(score_orders(chunk, token_ids, sub_orders, temperature)[yes])
+                    probs.append(self.per_option_probability(chunk, token_ids, sub_orders, temperature, yes))
                     if raw_confidence is not None:
                         raw.append(score_orders(chunk, token_ids, sub_orders, 1.0)[yes])
                 answers[name] = {**systemone_answer("labels", keys, probs, legend, 0.5), "mode": "per_option"}
