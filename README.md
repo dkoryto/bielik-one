@@ -326,7 +326,9 @@ CORS, shared internal-token/TLS settings and restricted management/prompt-logpro
 routes work as for the existing adapter middleware. When exposing the service,
 set `--api-key` and restrict non-`/v1` routes (including `/invocations`) with a
 reverse proxy or network policy: vLLM API-key authentication does not protect
-every route. The default middleware mode remains `adapter`.
+every route. Client connections to an exposed service must use HTTPS: configure
+both `--ssl-keyfile` and `--ssl-certfile`, or terminate TLS at that reverse
+proxy. The default middleware mode remains `adapter`.
 
 Native processing bounds use `SYSTEMONE_WORKERS` (8),
 `SYSTEMONE_READ_QUEUE_SIZE` (64), `SYSTEMONE_MAX_REQUESTS` (32),
