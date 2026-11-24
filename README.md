@@ -323,8 +323,10 @@ quantization. Supported modes include BF16, on-load FP8 and prequantized
 
 `GET /v1/systemone/health` checks backend/model readiness. vLLM authentication,
 CORS, shared internal-token/TLS settings and restricted management/prompt-logprob
-routes work as for the existing adapter middleware. Set `--api-key` when exposing
-the service. The default middleware mode remains `adapter`.
+routes work as for the existing adapter middleware. When exposing the service,
+set `--api-key` and restrict non-`/v1` routes (including `/invocations`) with a
+reverse proxy or network policy: vLLM API-key authentication does not protect
+every route. The default middleware mode remains `adapter`.
 
 Native processing bounds use `SYSTEMONE_WORKERS` (8),
 `SYSTEMONE_READ_QUEUE_SIZE` (64), `SYSTEMONE_MAX_REQUESTS` (32),

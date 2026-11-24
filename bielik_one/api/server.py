@@ -862,9 +862,11 @@ def build_app(engine: "LetterEngine", error_format: str = "default", *,
     if max_requests is not None:
         from fastapi import Request
         from bielik_one.api.request_execution import RequestExecutor
+        from bielik_one.api.remote_vllm import install_backend_errors
+        install_backend_errors(app,error_format)
         executor = RequestExecutor(max_requests,request_timeout)
         async def bounded_systemone(body: SystemOneIn, request: Request):
             return await executor.run(systemone,body,request)
         endpoint = bounded_systemone
-    app.add_api_route("/v1/systemone",endpoint,methods=["POST"])
+    app.add_api_route("/v1/systemone",endpoint,methods=["POST"],response_model=dict[str, Any])
     return app
