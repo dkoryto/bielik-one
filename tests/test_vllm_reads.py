@@ -247,7 +247,7 @@ def test_extreme_equal_scores_still_normalize():
     assert [math.exp(v) for v in values.values()]==pytest.approx([.5,.5])
 
 
-@pytest.mark.parametrize('table', [[], {'token_id:7':0,'token_id:9':'NaN'},
+@pytest.mark.parametrize('table', [[], {'token_id:7':10**400}, {'token_id:7':0,'token_id:9':'NaN'},
     {'token_id:7':0,'token_id:9':'-Infinity'}])
 def test_malformed_table_and_nonfinite_canary_are_typed(table):
     from bielik_one.api.vllm_reads import BackendReadError
@@ -398,9 +398,9 @@ def test_cancelled_queued_adapter_read_does_not_wait_for_other_request():
 def test_shutdown_cancelled_future_exits_bounded_map():
     import threading
     from concurrent.futures import ThreadPoolExecutor
-    from bielik_one.api.vllm_reads import BackendReadError
+    from bielik_one.api.vllm_reads import BackendReadError,_cancel_event
     reader=VllmTokenReadout('http://backend','base',workers=1,queue_size=2)
-    entered=threading.Event();release=threading.Event();queued=threading.Event()
+    entered=threading.Event();release=threading.Event();queued=threading.Event();cancel=threading.Event()
     original_submit=reader._submit
     def submit(fn,task):
         future=original_submit(fn,task)
@@ -410,18 +410,22 @@ def test_shutdown_cancelled_future_exits_bounded_map():
     def row(value):
         if value=='active':entered.set();assert release.wait(3)
         else:pytest.fail('shutdown did not cancel queued read')
+    def queued_request():
+        token=_cancel_event.set(cancel)
+        try:return reader.map(row,[('queued',)])
+        finally:_cancel_event.reset(token)
     try:
         with ThreadPoolExecutor(max_workers=3) as pool:
             active=pool.submit(reader.map,row,[('active',)])
             try:
                 assert entered.wait(2)
-                waiting=pool.submit(reader.map,row,[('queued',)])
+                waiting=pool.submit(queued_request)
                 assert queued.wait(2)
                 closing=pool.submit(reader.close)
                 with pytest.raises(BackendReadError,match='cancelled'):waiting.result(timeout=1)
-            finally:release.set()
+            finally:cancel.set();release.set()
             active.result(timeout=2);closing.result(timeout=2)
-    finally:release.set();reader.close()
+    finally:cancel.set();release.set();reader.close()
 
 
 def test_bounded_direct_app_maps_admission_overload():
@@ -434,3 +438,63 @@ def test_bounded_direct_app_maps_admission_overload():
         response=client.post('/v1/systemone',json={'model':'decision','state':'s','questions':{'q':{'type':'noul'}}})
         assert response.status_code==503 and response.headers['retry-after']=='1'
         assert response.json()['code']=='BACKEND_UNAVAILABLE'
+
+
+def test_bounded_admission_cancellation_releases_http_permit_promptly():
+    import asyncio,threading
+    from concurrent.futures import ThreadPoolExecutor
+    from bielik_one.api.request_execution import RequestExecutor
+    entered=threading.Event();release=threading.Event();waiting=threading.Event()
+    reader=VllmTokenReadout('http://backend','base',workers=1,queue_size=0,admission_timeout=2)
+    def row():entered.set();assert release.wait(4)
+    def queued_work(_):
+        waiting.set()
+        return reader.map(lambda:pytest.fail('cancelled request dispatched'),[()])
+    class Connected:
+        async def is_disconnected(self):return False
+    async def run():
+        executor=RequestExecutor(1,3)
+        task=asyncio.create_task(executor.run(queued_work,None,Connected()))
+        try:
+            assert await asyncio.to_thread(waiting.wait,2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):await task
+            # No active reads for this request: its permit must recover without
+            # waiting for the unrelated read or the two-second admission cap.
+            assert await asyncio.wait_for(executor.run(lambda _:'recovered',None,Connected()),.5)=='recovered'
+            assert not release.is_set()
+        finally:
+            release.set()
+            task.cancel();await asyncio.gather(task,return_exceptions=True)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            active=pool.submit(reader.map,row,[()])
+            try:
+                assert entered.wait(2)
+                asyncio.run(run())
+            finally:release.set()
+            active.result(timeout=2)
+    finally:release.set();reader.close()
+
+
+def test_cancel_after_slot_acquisition_returns_slot():
+    import threading
+    from bielik_one.api.vllm_reads import BackendReadError,_cancel_event
+    reader=VllmTokenReadout('http://backend','base',workers=1,queue_size=0)
+    cancel=threading.Event()
+    class CancellingSlot:
+        released=0
+        def acquire(self,timeout):cancel.set();return True
+        def release(self):self.released+=1
+    slot=CancellingSlot();reader.slots=slot
+    token=_cancel_event.set(cancel)
+    try:
+        with pytest.raises(BackendReadError,match='cancelled'):reader.map(lambda:None,[()])
+        assert slot.released==1
+    finally:_cancel_event.reset(token);reader.close()
+
+
+@pytest.mark.parametrize('name',['admission_timeout','timeout'])
+@pytest.mark.parametrize('value',[float('nan'),float('inf')])
+def test_transport_rejects_nonfinite_deadlines(name,value):
+    with pytest.raises(ValueError):VllmTokenReadout('http://backend','base',**{name:value})

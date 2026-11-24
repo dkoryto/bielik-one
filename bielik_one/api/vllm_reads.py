@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextvars
 import math
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 from collections.abc import Mapping
 
@@ -40,7 +41,7 @@ def conditional_logprobs(values, wanted):
 class VllmReadTransport:
     def __init__(self, url, model, *, workers=8, client=None, queue_size=64,
                  admission_timeout=1., timeout=180):
-        if not 1 <= workers <= 256 or (queue_size is not None and queue_size < 0) or admission_timeout <= 0 or timeout <= 0:
+        if not 1 <= workers <= 256 or (queue_size is not None and queue_size < 0) or not math.isfinite(admission_timeout) or admission_timeout <= 0 or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('Invalid backend concurrency or timeout configuration')
         self.url, self.model, self.workers = url.rstrip('/'), model, workers
         self.client = client or httpx.Client(timeout=httpx.Timeout(timeout,connect=10),trust_env=False,
@@ -94,7 +95,7 @@ class VllmReadTransport:
                     raise ValueError('invalid or clamped requested logprob')
             except BackendReadError:
                 raise
-            except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError) as exc:
+            except (httpx.HTTPError,ValueError,OverflowError,KeyError,IndexError,TypeError) as exc:
                 raise BackendReadError('vLLM did not return a complete decision read') from exc
             logits.update({i:table[i]-table[anchor] for i in chunk})
         return logits
@@ -105,9 +106,16 @@ class VllmReadTransport:
 
     def _submit(self, function, task):
         check_cancelled()
-        if self.slots is not None and not self.slots.acquire(timeout=self.admission_timeout):
-            raise BackendBusyError('Decision read queue is full; retry later')
+        if self.slots is not None:
+            deadline=time.monotonic()+self.admission_timeout
+            while True:
+                check_cancelled()
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    raise BackendBusyError('Decision read queue is full; retry later')
+                if self.slots.acquire(timeout=min(.05,remaining)):break
         try:
+            check_cancelled()
             with self.lifecycle:
                 if self.closed:raise BackendReadError('Decision reader is closed')
                 future=self.pool.submit(contextvars.copy_context().run,function,*task)
