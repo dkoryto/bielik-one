@@ -47,7 +47,7 @@ With the middleware, vLLM's own `--api-key` covers only paths under `/v1`. The p
 ## Checklist
 
 1. Frontend and vLLM listen on `127.0.0.1` (`ss -ltnp` shows no `0.0.0.0`/`*` for their ports), or a firewall admits only the proxy.
-2. The package is pinned: `--revision <commit>` and `--manifest-sha256 <digest>` (see the README).
+2. The package is pinned: `--revision <commit>` and `--manifest-sha256 <digest>` (see [serving.md](serving.md)).
 3. The proxy has a real certificate, and port 80 only redirects.
 4. Without credentials, every route except the probe gives 401, and the probe gives 403 from outside the allowed networks.
 5. With credentials, a decision and a short chat request succeed; `/docs` and any route not listed give 404.

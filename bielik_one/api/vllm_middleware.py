@@ -7,7 +7,8 @@
         --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware
 
 `bielik-one backend $PKG --shell` prints the full validated command (the LoRA path is $PKG/adapter for Llama adapter
-packages and $PKG for Qwen ones); append the --middleware flag to it.
+packages and $PKG for Qwen ones); append the --middleware flag to it. Chat tool and reasoning parsers are
+required. Set BIELIK_TOOLS_DIR for Bielik adapter/native commands; Qwen adapters use built-in vLLM parsers.
 
 Everything a client sees uses vLLM's served model name of the base model (--served-model-name, by default the model
 argument); the middleware reads it from /v1/models on the first decision request, so nothing has to repeat it:
@@ -29,7 +30,12 @@ adapter can be neither selected, unloaded nor loaded again under another name. O
 reads, which carry a per-process secret header, use the adapter.
 
 Environment:
-- SYSTEMONE_PACKAGE (required): the adapter package directory; its checksums are verified at startup.
+- SYSTEMONE_MODE: adapter (default) or native (original Bielik 3.2 answer tokens).
+- SYSTEMONE_PACKAGE (required): the adapter package directory, or the original checkpoint for native mode.
+  Adapter checksums are verified at startup; original native checkpoints have no package checksum manifest.
+- Native-only: SYSTEMONE_DECISION_PREFIX (empty-think/default or plain), SYSTEMONE_READ_QUEUE_SIZE (64),
+  SYSTEMONE_MAX_REQUESTS (32), SYSTEMONE_BACKEND_TIMEOUT (180 seconds), SYSTEMONE_REQUEST_TIMEOUT (300 seconds).
+  Native mode supports BF16 and opt-in FP8, no LoRA, raw_logprobs and max_logprobs >=128 (or unlimited).
 - SYSTEMONE_MODEL_NAME: optional; restricts /v1/systemone to this one of the base model's served names (default:
   every name vLLM serves the base model under, i.e. all --served-model-name values).
 - SYSTEMONE_LORA_NAME: the adapter's --lora-modules name (default: decision, as printed by `bielik-one backend`).
@@ -37,6 +43,7 @@ Environment:
   arrived on, with http://; required for --uds or TLS, e.g. https://<name in the certificate>:8000).
 - SYSTEMONE_SELF_CA: a CA bundle (PEM) that verifies the TLS certificate of SYSTEMONE_SELF_URL, when it is not
   signed by a CA in the system trust store (proxy variables are ignored for loopback reads).
+- SYSTEMONE_NATIVE_CALIBRATION: explicit native calibration file (default: beside model).
 - SYSTEMONE_NO_CALIBRATION=1: raw temperature-1 probabilities instead of the package's calibration.json.
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
@@ -100,21 +107,36 @@ class Settings:
     calibration: bool = True
     workers: int | None = None  # None: the value `bielik-one frontend` uses for the package
     max_body_mb: float = 16
+    mode: str = "adapter"
+    decision_prefix: str = "empty-think"
+    queue_size: int = 64
+    max_requests: int = 32
+    backend_timeout: float = 180
+    request_timeout: float = 300
+    native_calibration: str | None = None
 
     @classmethod
     def from_env(cls, env=None) -> "Settings":
         env = os.environ if env is None else env
+        mode = env.get("SYSTEMONE_MODE") or "adapter"
+        if mode not in ("adapter", "native"):
+            raise RuntimeError("SYSTEMONE_MODE must be adapter or native")
         package = env.get("SYSTEMONE_PACKAGE")
         if not package:
-            raise RuntimeError("SystemOne middleware: set SYSTEMONE_PACKAGE to the adapter package directory")
+            raise RuntimeError("SystemOne middleware: set SYSTEMONE_PACKAGE to the adapter package directory or original native checkpoint")
         root = Path(package).expanduser().resolve()
         public = env.get("SYSTEMONE_MODEL_NAME") or None
         try:
             workers = int(env["SYSTEMONE_WORKERS"]) if env.get("SYSTEMONE_WORKERS") else None
             max_body_mb = float(env.get("SYSTEMONE_MAX_BODY_MB") or 16)
+            queue_size = int(env.get("SYSTEMONE_READ_QUEUE_SIZE", "64"))
+            max_requests = int(env.get("SYSTEMONE_MAX_REQUESTS", "32"))
+            backend_timeout = float(env.get("SYSTEMONE_BACKEND_TIMEOUT", "180"))
+            request_timeout = float(env.get("SYSTEMONE_REQUEST_TIMEOUT", "300"))
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
         settings = cls(
+            mode=mode, native_calibration=env.get("SYSTEMONE_NATIVE_CALIBRATION") or None,
             public_name=public,
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
             package=root,
@@ -124,11 +146,14 @@ class Settings:
             calibration=not _flag(env.get("SYSTEMONE_NO_CALIBRATION")),
             workers=workers,
             max_body_mb=max_body_mb,
+            decision_prefix=env.get("SYSTEMONE_DECISION_PREFIX") or "empty-think",
+            queue_size=queue_size, max_requests=max_requests,
+            backend_timeout=backend_timeout, request_timeout=request_timeout,
         )
         if env.get("SYSTEMONE_INTERNAL_TOKEN"):
             settings.internal_token = env["SYSTEMONE_INTERNAL_TOKEN"]
             settings.shared_token = True
-        if settings.public_name is not None and settings.lora_name == settings.public_name:
+        if mode == "adapter" and settings.public_name is not None and settings.lora_name == settings.public_name:
             raise RuntimeError("SystemOne middleware: the LoRA name must differ from the public model name")
         if settings.self_ca is not None and not Path(settings.self_ca).expanduser().is_file():
             raise RuntimeError(f"SYSTEMONE_SELF_CA={settings.self_ca!r} is not a file")
@@ -136,6 +161,16 @@ class Settings:
             raise RuntimeError("SYSTEMONE_WORKERS must be between 1 and 256")
         if not math.isfinite(settings.max_body_mb) or settings.max_body_mb * 2**20 < 1:
             raise RuntimeError("SYSTEMONE_MAX_BODY_MB must be finite and at least one byte")
+        native_options = ("SYSTEMONE_NATIVE_CALIBRATION", "SYSTEMONE_DECISION_PREFIX", "SYSTEMONE_READ_QUEUE_SIZE", "SYSTEMONE_MAX_REQUESTS",
+                          "SYSTEMONE_BACKEND_TIMEOUT", "SYSTEMONE_REQUEST_TIMEOUT")
+        if mode == "adapter" and any(name in env for name in native_options):
+            raise RuntimeError("native request settings require SYSTEMONE_MODE=native")
+        if settings.decision_prefix not in ("plain", "empty-think"):
+            raise RuntimeError("SYSTEMONE_DECISION_PREFIX must be plain or empty-think")
+        if not 0 <= settings.queue_size <= 4096 or not 1 <= settings.max_requests <= 256:
+            raise RuntimeError("native queue size must be 0..4096 and max requests 1..256")
+        if any(not math.isfinite(x) or x <= 0 for x in (backend_timeout, request_timeout)):
+            raise RuntimeError("native timeouts must be finite and positive")
         return settings
 
     def ssl_context(self) -> ssl.SSLContext | None:
@@ -158,6 +193,8 @@ def build_engine(settings: Settings):
     from bielik_one.api.remote_vllm import RemoteVllmEngine, resolve_calibration
 
     root = settings.package
+    if settings.mode == "native":
+        return _build_native_engine(settings)
     launch.verify(root)
     kind = launch.detect(root)
     if kind not in ("llama-adapter", "qwen-adapter"):
@@ -213,10 +250,51 @@ def build_engine(settings: Settings):
     # /v1/systemone answers to the served names only (not "decision" or the reference repo name); they are
     # read from vLLM when the middleware binds, so nothing is accepted before that.
     engine.aliases = set()
+    engine.chat_parser_profile = "qwen" if kind == "qwen-adapter" else "bielik"
     log.info(
         "SystemOne decisions at %s (adapter %r, %d workers, calibration: %s)",
         DECISION_PATH, settings.lora_name, settings.workers, source or "none",
     )
+    return engine
+
+
+def _build_native_engine(settings):
+    import httpx
+    from transformers import AutoTokenizer
+    from bielik_one.api.base_tokens import BaseTokenEngine, VllmTokenReadout
+    from bielik_one.api.remote_vllm import resolve_calibration
+
+    root = settings.package
+    config = json.loads((root / "config.json").read_text())
+    if config.get("model_type") != "llama" or config.get("architectures") != ["LlamaForCausalLM"]:
+        raise RuntimeError("native middleware requires an original LlamaForCausalLM checkpoint")
+    if any((root / name).exists() for name in ("conversion.json", "heads.json", "adapter_config.json")):
+        raise RuntimeError("native middleware requires original weights, not an adapter or decision package")
+    if os.environ.get("SYSTEMONE_HEADS_MANIFEST"):
+        raise RuntimeError("unset SYSTEMONE_HEADS_MANIFEST for native middleware")
+    tok = AutoTokenizer.from_pretrained(root, local_files_only=True)
+    if settings.workers is None:
+        settings.workers = 8
+    headers = {INTERNAL_HEADER: settings.internal_token}
+    if settings.api_key:
+        headers["Authorization"] = f"Bearer {settings.api_key}"
+    client = httpx.Client(timeout=httpx.Timeout(settings.backend_timeout, connect=10), trust_env=False,
+                          headers=headers, verify=settings.verify(),
+                          limits=httpx.Limits(max_connections=settings.workers, max_keepalive_connections=settings.workers))
+    reader = None
+    try:
+        reader = VllmTokenReadout("http://unbound", "unbound", workers=settings.workers,
+                                  queue_size=settings.queue_size, timeout=settings.backend_timeout, client=client)
+        engine = BaseTokenEngine(tok, reader, model_name="unbound",
+                                 empty_think=settings.decision_prefix == "empty-think")
+        if settings.native_calibration is not None and not settings.calibration:
+            raise ValueError('Explicit native calibration conflicts with disabled calibration')
+        engine.temperatures,engine.calibration_source=resolve_calibration(root/'config.json',settings.native_calibration,not settings.calibration)
+    except BaseException:
+        reader.close() if reader is not None else client.close()
+        raise
+    engine.client = client
+    engine.aliases = set()
     return engine
 
 
@@ -373,6 +451,31 @@ class _ModelListRoute:
         return await self.app(scope, receive, send)
 
 
+def native_quantization_supported(method, model_config):
+    if method in (None, 'fp8', 'fp8_per_tensor'):
+        return True
+    if method != 'compressed-tensors':
+        return False
+    hf_config = getattr(model_config, 'hf_config', None)
+    config = getattr(hf_config, 'quantization_config', None)
+    if not isinstance(config, dict) or config.get('format') != 'float-quantized':
+        return False
+    groups = config.get('config_groups')
+    if not isinstance(groups, dict) or not groups:
+        return False
+    for group in groups.values():
+        if not isinstance(group, dict):
+            return False
+        weights = group.get('weights')
+        if not isinstance(weights, dict) or weights.get('num_bits') != 8 or weights.get('type') != 'float':
+            return False
+        for key in ('input_activations', 'output_activations'):
+            activation = group.get(key)
+            if activation is not None and (not isinstance(activation, dict) or activation.get('num_bits') != 8 or activation.get('type') != 'float'):
+                return False
+    return True
+
+
 class SystemOneMiddleware:
     """ASGI middleware for `vllm serve --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware`."""
 
@@ -395,9 +498,13 @@ class SystemOneMiddleware:
             if any(getattr(r, "path", None) == path and not _vllm_structured_decisions(r) for r in router.routes):
                 raise RuntimeError(f"vLLM already defines {path}; refusing to shadow it")
         self.settings = settings or Settings.from_env()
+        if self.settings.mode not in ("adapter", "native"):
+            raise RuntimeError("SYSTEMONE_MODE must be adapter or native")
         self.engine = engine if engine is not None else build_engine(self.settings)
         # Only the typed decision route: the chat, model and health routes are vLLM's own.
-        self.decision_app = build_app(self.engine)
+        self.decision_app = build_app(self.engine,
+            max_requests=self.settings.max_requests if self.settings.mode == "native" else None,
+            request_timeout=self.settings.request_timeout)
         install_backend_errors(self.decision_app)
         self.decisions = guarded(self.decision_app, self.settings.max_body_mb)
         self.public_names: list[str] = []  # the base model's served names, read from vLLM at bind
@@ -441,6 +548,9 @@ class SystemOneMiddleware:
             try:
                 self._check_server_count(app)
                 async with original_lifespan(app) as state:
+                    if self.settings.mode == "native":
+                        self._check_native_backend(app)
+                    self._check_chat_parsers(app)
                     yield state
             finally:
                 self.engine.close()
@@ -455,6 +565,55 @@ class SystemOneMiddleware:
                 f"SystemOne middleware: --api-server-count {count} needs SYSTEMONE_INTERNAL_TOKEN set to one secret "
                 "shared by every API process (loopback reads can reach any of them)"
             )
+    def _check_chat_parsers(self, app):
+        profile = "bielik" if self.settings.mode == "native" else getattr(self.engine, "chat_parser_profile", None)
+        args = getattr(app.state, "args", None)
+        config = getattr(app.state, "vllm_config", None)
+        structured = getattr(config, "structured_outputs_config", None)
+        if structured is None:
+            structured = getattr(args, "structured_outputs_config", None)
+        reasoning = getattr(structured, "reasoning_parser", None) if structured is not None else getattr(args, "reasoning_parser", None)
+        tool = "bielik" if profile == "bielik" else "qwen3_coder" if profile == "qwen" else None
+        expected_reasoning = "bielik" if profile == "bielik" else "qwen3" if profile == "qwen" else None
+        actual_tool = getattr(args, "tool_call_parser", None)
+        if (not getattr(args, "enable_auto_tool_choice", False) or not actual_tool or not reasoning
+                or (tool is not None and actual_tool != tool)
+                or (expected_reasoning is not None and reasoning != expected_reasoning)):
+            raise RuntimeError(
+                f"Chat tool and reasoning parsers are required: --enable-auto-tool-choice "
+                f"--tool-call-parser {tool or '<model-specific-parser>'} --reasoning-parser {expected_reasoning or '<model-specific-parser>'}. "
+                "Use the complete command printed by bielik-one backend --shell, including parser-plugin flags for Bielik."
+            )
+
+    def _check_native_backend(self, app):
+        args = getattr(app.state, "args", None)
+        config = getattr(app.state, "vllm_config", None)
+        model = getattr(config, "model_config", None)
+        if model is None:
+            raise RuntimeError("native middleware requires vLLM's resolved model configuration")
+        if getattr(args, "enable_lora", False) or getattr(config, "lora_config", None) is not None:
+            raise RuntimeError("native middleware requires a server without LoRA")
+        for source in (args, model):
+            if source is None:
+                continue
+            if not native_quantization_supported(getattr(source, "quantization", None), model):
+                raise RuntimeError("native middleware supports BF16 or FP8 quantization")
+            dtype = str(getattr(source, "dtype", "auto")).removeprefix("torch.")
+            if dtype not in ("auto", "bfloat16", "None"):
+                raise RuntimeError("native middleware currently requires BF16")
+            mode = getattr(source, "logprobs_mode", None)
+            if mode is not None and mode != "raw_logprobs":
+                raise RuntimeError("native middleware requires --logprobs-mode raw_logprobs")
+            max_logprobs = getattr(source, "max_logprobs", None)
+            if max_logprobs is not None and max_logprobs != -1 and max_logprobs < 128:
+                raise RuntimeError("native middleware requires --max-logprobs at least 128")
+        if model is not None:
+            for value in (getattr(model, "model", None), getattr(model, "tokenizer", None)):
+                if value is not None and Path(value).expanduser().resolve() != self.settings.package:
+                    raise RuntimeError("native model and tokenizer must match SYSTEMONE_PACKAGE")
+        length = getattr(model, "max_model_len", None) or getattr(args, "max_model_len", None)
+        if length is not None:
+            self.engine.max_model_len = int(length)
 
     def _configure_credentials(self, scope):
         if self._credentials_configured:
@@ -537,6 +696,11 @@ class SystemOneMiddleware:
         """Bind to this server's model names; on failure, the remembered (time, status, error body)."""
         from bielik_one.api.errors import BACKEND_UNAVAILABLE, INTERNAL_ERROR, error_bytes
 
+        if self.settings.mode == "native":
+            try:
+                self._check_native_backend(scope["app"])
+            except RuntimeError as exc:
+                return (time.monotonic(), 500, error_bytes(500, INTERNAL_ERROR, str(exc), path=DECISION_PATH))
         url = self.settings.self_url or self._url_from_scope(scope)
         if url is None:
             problem = (
@@ -583,6 +747,9 @@ class SystemOneMiddleware:
             async with httpx.AsyncClient(
                 timeout=10, trust_env=False, verify=self._verify, transport=self.check_transport
             ) as client:
+                if self.settings.mode == "native":
+                    readiness = await client.get(url + "/health", headers=headers)
+                    readiness.raise_for_status()
                 response = await client.get(url + MODELS_PATH, headers=headers)
                 response.raise_for_status()
                 cards = [card for card in response.json()["data"] if isinstance(card, dict)]
@@ -590,14 +757,17 @@ class SystemOneMiddleware:
             return [], f"cannot list this server's models at {url}{MODELS_PATH} ({exc!r}); set SYSTEMONE_SELF_URL"
         lora = self.settings.lora_name
         served = [card.get("id") for card in cards]
-        if lora not in served:
+        if self.settings.mode == "native" and any(card.get("parent") for card in cards):
+            return [], "native middleware requires an original base model without adapters"
+        if self.settings.mode == "adapter" and lora not in served:
             return [], (
                 f"vLLM does not serve the decision adapter {lora!r} (served: {served}); start it with "
                 f"--lora-modules {lora}=<adapter path>, or set SYSTEMONE_LORA_NAME to the name used there"
             )
-        if not any(card.get("id") == lora and card.get("parent") for card in cards):
+        if self.settings.mode == "adapter" and not any(card.get("id") == lora and card.get("parent") for card in cards):
             return [], f"{lora!r} is not a LoRA adapter in vLLM's model list"
-        names = [card["id"] for card in cards if not card.get("parent") and card.get("id") and card["id"] != lora]
+        names = [card["id"] for card in cards if not card.get("parent") and card.get("id")
+                 and (self.settings.mode == "native" or card["id"] != lora)]
         if not names:
             return [], f"vLLM lists no base model name (served: {served})"
         wanted = self.settings.public_name
@@ -619,6 +789,9 @@ class SystemOneMiddleware:
         if getattr(self.engine, "base_row_types", None):
             self.engine.base_alias = names[0]
         self.engine.backend_url = url
+        if self.settings.mode == "native":
+            self.engine.readout.url = url
+            self.engine.readout.model = names[0]
         # Optional reasoning pass: generated by the base model under its served name, through the vLLM routes.
         self.engine.reasoners["original"] = EndpointReasoner(
             url + "/v1", names[0], key_env="VLLM_API_KEY", tok=getattr(self.engine, "tok", None),
@@ -640,7 +813,8 @@ class SystemOneMiddleware:
             return
         try:
             # A request without a model keeps none: vLLM answers it with its default served name, as without us.
-            body = public_request_body(_scrub_sampling_params(raw), {self.settings.lora_name}, None)
+            blocked = {self.settings.lora_name} if self.settings.mode == "adapter" else set()
+            body = public_request_body(_scrub_sampling_params(raw), blocked, None)
         except RequestError as exc:
             return await _send_json(send, 400, error_bytes(400, INVALID_REQUEST, exc.msg, fmt="openai"))
         replayed = False
@@ -658,6 +832,8 @@ class SystemOneMiddleware:
 
     def _models_filter(self, send):
         """Leave the LoRA name out of GET /v1/models."""
+        if self.settings.mode == "native":
+            return send
         start = None
         parts = []
 

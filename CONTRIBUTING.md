@@ -26,7 +26,7 @@ Do not open a public issue for a vulnerability (for example a way to make the pu
    pip install -e ".[test]" && pytest -q
    ```
 
-4. Update `README.md` when you change flags, endpoints, limits or defaults.
+4. Update the relevant guide in `docs/` when you change flags, endpoints, limits or defaults. Keep `README.md` focused on the quick start and model selection.
 
 Changes to prompt rendering (`bielik_one/prompting/`), decision reads (`bielik_one/api/remote_vllm.py`, `merged_vllm.py`) or the vLLM plugin (`vllm-heads-plugin/`) can silently change model outputs. The served prompts must stay token-identical to the ones the models were trained and evaluated on. For such changes, please say whether you checked decisions against an unchanged server on a real GPU (for example a few hundred validation-style questions per question type) and what agreement you saw. Maintainers may run this check before merging.
 
