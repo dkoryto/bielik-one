@@ -65,12 +65,19 @@ curl -s -o /dev/null -w '%{http_code}\n' -u alice https://$H/docs               
 curl -s -u alice https://$H/v1/systemone -H 'Content-Type: application/json' -d '{
   "model": "decision", "state": "The invoice is overdue.",
   "questions": {"late": {"type": "noul", "instructions": "Is the payment late?"}}}'         # an answer (frontend)
-curl -s -o /dev/null -w '%{http_code}\n' http://$H:8026/health                             # connection refused (frontend)
-curl -s -o /dev/null -w '%{http_code}\n' http://$H:8025/health                             # connection refused (vLLM backend)
-curl -s -o /dev/null -w '%{http_code}\n' http://$H:8000/health                             # connection refused (vllm serve with the middleware)
 ```
 
-A `curl` that prints `000` means the connection failed, which is the expected result for the last three. Any HTTP status there means the port is reachable from outside. With other `--port` / `--backend-host` values, check those ports instead; for the 4B packages the defaults are 8012 (frontend) and 8013 (backend).
+With client certificates (mTLS) instead of Basic, replace `-u alice` with `--cert client.pem --key client.key`. Without a certificate, every route except the probe then gives 403 rather than 401.
+
+Then check that the services themselves cannot be reached from outside. Run this against every host that runs one of them, with `$S` that host's address: the proxy host when they run next to the proxy, as in the layout above, or each service host in a firewalled layout:
+
+```bash
+for port in 8026 8025 8000; do                     # frontend, vLLM backend, vllm serve with the middleware
+  curl -sS -o /dev/null --connect-timeout 5 http://$S:$port/health; echo "port $port: curl exit $?"
+done
+```
+
+Every port must end with exit 7 (connection refused) or 28 (timed out, for example dropped by a firewall). Any other result means something accepted the connection and the port is reachable, even when curl printed no HTTP status: 0 is an answer, and 52 an empty reply. With other `--port` / `--backend-host` values, check those ports instead; for the 4B packages the defaults are 8012 (frontend) and 8013 (backend).
 
 With the middleware, `decision` is the internal adapter name and is refused (422). Use the base model's public name instead, one of those listed by `curl -s -u alice https://$H/v1/models` (for example `bielik-base`):
 
