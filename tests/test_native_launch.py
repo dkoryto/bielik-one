@@ -50,8 +50,6 @@ def test_native_does_not_silently_ignore_newer_engine_flags(tmp_path):
     root=original(tmp_path)
     with pytest.raises(ValueError,match='requires --engine vllm'):
         dry('backend',root,'--native-tokens','--engine','mlx')
-    with pytest.raises(ValueError,match='not yet supported'):
-        dry('backend',root,'--native-tokens','--bielik-tools-dir','/does/not/matter')
 
 
 def test_native_backend_accepts_opt_in_fp8(tmp_path):
@@ -89,3 +87,28 @@ def test_native_frontend_cli_reaches_real_application_startup(tmp_path,monkeypat
     monkeypatch.setattr(uvicorn,'run',run)
     base_tokens.main()
     assert started and started[0]['port']==8026
+
+
+def test_native_chat_parsers_reuse_shipped_template_and_respect_opt_out(tmp_path,monkeypatch):
+    import shlex
+    from bielik_one import launch
+    root=original(tmp_path)
+    tools=tmp_path/'bielik tools'/'tools';tools.mkdir(parents=True)
+    for name in ['bielik_vllm_tool_parser.py','bielik_vllm_reasoning_parser.py']:
+        (tools/name).write_text('# external parser fixture')
+    monkeypatch.setenv('BIELIK_TOOLS_DIR','/missing/environment')
+    cmd=dry('backend',root,'--native-tokens','--bielik-tools-dir',str(tools.parent))['command']
+    assert cmd[cmd.index('--tool-parser-plugin')+1]==str(tools/'bielik_vllm_tool_parser.py')
+    assert cmd[cmd.index('--reasoning-parser-plugin')+1]==str(tools/'bielik_vllm_reasoning_parser.py')
+    assert cmd[cmd.index('--tool-call-parser')+1]=='bielik'
+    assert cmd[cmd.index('--reasoning-parser')+1]=='bielik'
+    assert '--enable-auto-tool-choice' in cmd and '--chat-template' not in cmd
+    assert '--tool-call-parser' not in dry('backend',root,'--native-tokens','--no-bielik-chat-parsers')['command']
+    monkeypatch.setenv('BIELIK_TOOLS_DIR',str(tools.parent))
+    assert dry('backend',root,'--native-tokens')['command']==cmd
+    assert '--tool-call-parser' not in dry('frontend',root,'--native-tokens')['command']
+    with pytest.raises(ValueError,match='vLLM backend options'):
+        dry('frontend',root,'--native-tokens','--bielik-tools-dir',str(tools.parent))
+    (tools/'bielik_vllm_tool_parser.py').unlink()
+    with pytest.raises(ValueError,match='Missing bielik-tools file'):
+        dry('backend',root,'--native-tokens')

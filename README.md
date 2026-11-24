@@ -372,3 +372,35 @@ provenance. `complete_validation_collection: false` marks a provisional file and
 prevents loading it. Calibration values belong with model weights, not in the
 library. Temperature scaling runs in the API on CPU without changing weights or
 requiring another model pass.
+
+#### Tools and reasoning in native Bielik 3.2 chat
+
+Native serving can load the same upstream `bielik-tools` parsers as adapter
+serving, without modifying the original chat template or decision prompts:
+
+```bash
+bielik-one backend /path/to/bielik-3.2 --native-tokens \
+  --bielik-tools-dir /path/to/bielik-tools
+```
+
+`BIELIK_TOOLS_DIR` provides the default directory; the explicit flag wins.
+`--no-bielik-chat-parsers` disables this setting. Without a directory, parsers
+remain disabled. The checkout must contain the tool/reasoning parsers compatible
+with vLLM 0.32.0. No parser files are copied or downloaded by the launcher.
+
+For direct `vllm serve` with the native middleware, add:
+
+```bash
+--enable-auto-tool-choice \
+--tool-parser-plugin /path/to/bielik-tools/tools/bielik_vllm_tool_parser.py \
+--tool-call-parser bielik \
+--reasoning-parser-plugin /path/to/bielik-tools/tools/bielik_vllm_reasoning_parser.py \
+--reasoning-parser bielik \
+--exclude-tools-when-tool-choice-none
+```
+
+These settings apply to ordinary chat: tool calls are returned in `tool_calls`
+and thinking output is separated into the reasoning field. For Bielik 3.2,
+`reasoning_effort: "none"` disables thinking; a supported non-none effort enables
+it. Keep token budgets large enough to complete thinking and the final answer.
+The typed decision endpoint continues reading the configured answer tokens.

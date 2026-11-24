@@ -488,7 +488,7 @@ class BielikChatParserTests(unittest.TestCase):
         for kind in ("qwen-adapter", "qwen-merged", "llama-merged"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as d:
                 package(kind, Path(d))
-                with self.assertRaisesRegex(ValueError, "Bielik adapter packages only"):
+                with self.assertRaisesRegex(ValueError, "Bielik adapter or native packages only"):
                     dry("backend", d, "--bielik-tools-dir", d)
 
     def test_advanced_template_required_only_for_30(self):

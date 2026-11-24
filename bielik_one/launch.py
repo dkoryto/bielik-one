@@ -329,16 +329,20 @@ BIELIK_CHAT_MODELS = {
 
 def bielik_chat_args(root: Path, kind: str, tools_dir: str) -> list[str]:
     """Opt-in chat setup from a local bielik-tools checkout (vLLM 0.32)."""
-    if kind != "llama-adapter":
-        raise ValueError("--bielik-tools-dir supports Bielik adapter packages only")
-    model = json.loads((root / "serving.json").read_text())["base_model"]
-    if model not in BIELIK_CHAT_MODELS:
-        raise ValueError(f"--bielik-tools-dir: unsupported base model {model!r}")
+    if kind == "native-tokens":
+        # Original Bielik 3.2 already supplies its chat template.
+        advanced_template = False
+    else:
+        if kind != "llama-adapter":
+            raise ValueError("--bielik-tools-dir supports Bielik adapter or native packages only")
+        model = json.loads((root / "serving.json").read_text())["base_model"]
+        if model not in BIELIK_CHAT_MODELS:
+            raise ValueError(f"--bielik-tools-dir: unsupported base model {model!r}")
+        advanced_template = BIELIK_CHAT_MODELS[model]
     tools = Path(tools_dir).expanduser().resolve() / "tools"
     tool_parser = tools / "bielik_vllm_tool_parser.py"
     reasoning_parser = tools / "bielik_vllm_reasoning_parser.py"
     template = tools / "bielik_advanced_chat_template.jinja"
-    advanced_template = BIELIK_CHAT_MODELS[model]
     required = [tool_parser, reasoning_parser] + ([template] if advanced_template else [])
     for path in required:
         if not path.is_file():
@@ -356,6 +360,12 @@ def bielik_chat_args(root: Path, kind: str, tools_dir: str) -> list[str]:
     if advanced_template:
         argv += ["--chat-template", str(template)]
     return argv
+
+
+def chat_tools_dir(args):
+    if args.no_bielik_chat_parsers:
+        return None
+    return args.bielik_tools_dir if args.bielik_tools_dir is not None else os.environ.get("BIELIK_TOOLS_DIR")
 
 
 def frontend(
@@ -477,8 +487,6 @@ def native_commands(root, component, args):
     """Explicit untouched-Llama profile; never auto-detect this for decision packages."""
     if args.engine != "vllm":
         raise ValueError("--native-tokens currently requires --engine vllm")
-    if args.bielik_tools_dir is not None:
-        raise ValueError("--bielik-tools-dir is not yet supported by --native-tokens")
     cfg = json.loads((root / "config.json").read_text())
     if cfg.get("model_type") != "llama" or cfg.get("architectures") != ["LlamaForCausalLM"]:
         raise ValueError("native tokens require an original LlamaForCausalLM checkpoint")
@@ -492,6 +500,9 @@ def native_commands(root, component, args):
                    "--logprobs-mode", "raw_logprobs", "--enable-prefix-caching",
                    "--max-num-seqs", str(args.max_num_seqs or 8),
                    "--max-num-batched-tokens", "2048", "--gpu-memory-utilization", "0.90"]
+        tools_dir = chat_tools_dir(args)
+        if tools_dir:
+            command += bielik_chat_args(root, "native-tokens", tools_dir)
         if args.fp8:
             command += FP8
         if args.kv_cache_gb is not None:
@@ -541,7 +552,7 @@ def main(argv=None):
     chat.add_argument(
         "--bielik-tools-dir",
         metavar="DIR",
-        help="vLLM backend: enable tools/reasoning for Bielik 3.1, 3.0 or Minitron 3.0 adapters "
+        help="vLLM backend: enable tools/reasoning for native Bielik 3.2 or Bielik 3.1, 3.0 and Minitron adapters "
         "using this bielik-tools checkout (default: BIELIK_TOOLS_DIR); no files are downloaded",
     )
     chat.add_argument(
@@ -723,9 +734,7 @@ def main(argv=None):
         argv, extra = backend(
             root, kind, a.backend_host, a.port or back_port, a.fp8, a.eager
         )
-        tools_dir = None if a.no_bielik_chat_parsers else (
-            a.bielik_tools_dir if a.bielik_tools_dir is not None else os.environ.get("BIELIK_TOOLS_DIR")
-        )
+        tools_dir = chat_tools_dir(a)
         if tools_dir:
             try:
                 argv += bielik_chat_args(root, kind, tools_dir)
