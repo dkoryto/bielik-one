@@ -97,6 +97,13 @@ def test_require_pinned_revision_on_a_local_directory_needs_the_digest(local_pac
     assert out["manifest_pinned"] is True
 
 
+def test_native_checkpoints_have_no_manifest_to_pin(local_package):
+    with pytest.raises(ValueError, match="does not apply to --native-tokens"):
+        dry("backend", str(local_package), "--native-tokens", "--manifest-sha256", "ab" * 32)
+    with pytest.raises(ValueError, match="local native checkpoint has no revision or manifest"):
+        dry("backend", str(local_package), "--native-tokens", "--require-pinned-revision")
+
+
 def test_without_flags_nothing_changes(local_package):
     republish(local_package)
     assert dry("backend", str(local_package))["kind"] == "qwen-merged"
@@ -112,6 +119,10 @@ def test_middleware_reads_the_pinned_digest():
     assert settings.manifest_sha256 == "ab" * 32
     with pytest.raises(RuntimeError, match="SYSTEMONE_MANIFEST_SHA256"):
         middleware.Settings.from_env({"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_MANIFEST_SHA256": "nope"})
+    with pytest.raises(RuntimeError, match="does not apply to native mode"):
+        middleware.Settings.from_env(
+            {"SYSTEMONE_PACKAGE": "/tmp/package", "SYSTEMONE_MODE": "native", "SYSTEMONE_MANIFEST_SHA256": "ab" * 32}
+        )
 
 
 def test_middleware_refuses_a_package_that_does_not_match_before_anything_else():

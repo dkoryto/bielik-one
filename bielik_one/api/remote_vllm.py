@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import contextvars
 import json
@@ -15,6 +14,7 @@ import httpx
 from fastapi import Request
 
 from bielik_one.api.server import (
+    CONTEXT_LIMIT,
     DEFAULT_READ_TWICE_MAX_INPUT_TOKENS,
     LetterEngine,
     RequestError,
@@ -33,8 +33,9 @@ from bielik_one.api.reasoning import ReasoningError
 from bielik_one.prompting.inference import inference_ids
 from bielik_one.prompting.letter import answer_token_ids
 
-# vLLM 0.32 caps logprob_token_ids at 128 per request (vllm.sampling_params.MAX_LOGPROB_TOKEN_IDS).
-MAX_LOGPROB_TOKEN_IDS = 128
+from bielik_one.api.vllm_reads import (
+    MAX_LOGPROB_TOKEN_IDS, BackendReadError, BackendBusyError, VllmReadTransport, conditional_logprobs, check_cancelled
+)
 
 # Request-local collection: concurrent requests must never share inference metadata.
 _prompt_variants = contextvars.ContextVar("prompt_variants", default=None)
@@ -60,6 +61,10 @@ def load_calibration(path: Path, model: str | None = None) -> dict:
     A request `temperature` still wins. `model` (the metadata source_repo) must match the file.
     """
     data = json.loads(Path(path).read_text())
+    if not isinstance(data,dict):
+        raise ValueError("calibration.json must be an object")
+    if data.get("complete_validation_collection") is False:
+        raise ValueError("Calibration is provisional: validation collection is incomplete")
     if model is not None and data.get("model") != model:
         raise ValueError(
             f"calibration.json is for {data.get('model')!r}, not for {model!r}"
@@ -125,11 +130,23 @@ def package_dir(metadata_path, wanted: str) -> Path:
     return first.parent
 
 
-class BackendReadError(RuntimeError):
-    pass
-
-
 class RemoteVllmEngine(LetterEngine):
+    strict_read_twice_context = False
+    report_output_reads = True
+
+    def load_calibration(self,path):
+        self.temperatures=load_calibration(path)
+        self.calibration_source=str(path)
+
+    def prompt_ids(self,row,**kwargs):
+        return inference_ids(self.tok,row,self.semantic,**kwargs)
+
+    def read_tasks(self,tasks):
+        return self.transport.map(self._read,tasks)
+
+    def read_metadata(self,outputs,prompt):
+        return {}
+
     def __init__(
         self,
         metadata: dict,
@@ -210,11 +227,11 @@ class RemoteVllmEngine(LetterEngine):
                 max_connections=workers, max_keepalive_connections=workers
             ),
         )
-        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.transport = VllmReadTransport(self.backend_url,self.backend_model,workers=workers,client=self.client,queue_size=None)
+        self.pool = self.transport.pool
 
     def close(self):
-        self.pool.shutdown(wait=True, cancel_futures=True)
-        self.client.close()
+        self.transport.close()
 
     def _chunk_width(self, on_base: bool) -> int:
         """Option ids per backend read: vLLM accepts at most MAX_LOGPROB_TOKEN_IDS ids per request, and every
@@ -222,72 +239,12 @@ class RemoteVllmEngine(LetterEngine):
         return MAX_LOGPROB_TOKEN_IDS - 1 - (1 if on_base else 0)
 
     def _read(self, prompt: list[int], output_ids: list[int], kind: str):
-        """Every chunk includes a common anchor, cancelling its softmax normalizer."""
         anchor = int(self.parking["anchor_id"])
         on_base = kind in self.base_row_types
-        logits = {}
-        width = self._chunk_width(on_base)
-        for offset in range(0, len(output_ids), width):
-            chunk = output_ids[offset : offset + width]
-            requested = chunk + [anchor]
-            # Flagged base rows must come back as head-only logits: a non-head canary must be -inf. If the backend
-            # was started without the logits processor it would be finite, and the read fails instead of
-            # returning base-model vocabulary probabilities.
-            canary = [self.canary_id] if on_base else []
-            payload = {
-                "model": self.base_alias if on_base else self.backend_model,
-                "prompt": prompt,
-                "max_tokens": 1,
-                "temperature": 1,
-                "top_p": 1,
-                "top_k": -1,
-                "min_p": 0,
-                "repetition_penalty": 1,
-                "logprobs": 1,
-                "logprob_token_ids": requested + canary,
-                "return_tokens_as_token_ids": True,
-                "seed": 0,
-            }
-            if on_base:
-                payload["vllm_xargs"] = {"systemone_head": "base"}
-            try:
-                rid = backend_request_id()
-                response = self.client.post(
-                    self.backend_url + "/v1/completions",
-                    json=payload,
-                    headers={"X-Request-Id": rid} if rid else None,
-                )
-                response.raise_for_status()
-                result = response.json()
-                values = result["choices"][0]["logprobs"]["top_logprobs"][0]
-                table = {
-                    int(k.removeprefix("token_id:")): float(v)
-                    for k, v in values.items()
-                }
-                if any(
-                    i not in table or not math.isfinite(table[i]) for i in requested
-                ):
-                    raise ValueError("missing or non-finite requested logprobs")
-                if canary and (canary[0] not in table or table[canary[0]] > -9990):
-                    raise ValueError(
-                        "backend did not apply decision heads to a flagged base row (logits processor missing?)"
-                    )
-                if any(table[i] <= -9990 for i in requested):
-                    raise ValueError("invalid or clamped requested logprob")
-                if result["usage"]["prompt_tokens"] != len(prompt):
-                    raise ValueError("backend changed prompt length")
-            except (
-                httpx.HTTPError,
-                ValueError,
-                KeyError,
-                IndexError,
-                TypeError,
-            ) as exc:
-                raise BackendReadError(
-                    "vLLM did not return a complete decision read"
-                ) from exc
-            for token_id in chunk:
-                logits[token_id] = table[token_id] - table[anchor]
+        logits = self.transport.read(prompt,output_ids,anchor=anchor,
+            canary=self.canary_id if on_base else None,url=self.backend_url,
+            model=self.base_alias if on_base else self.backend_model,
+            extra={"vllm_xargs":{"systemone_head":"base"}} if on_base else None)
         if kind == "labels":
             # The inherited reader applies sigmoid(logit - anchor); add bias once.
             return {
@@ -297,11 +254,7 @@ class RemoteVllmEngine(LetterEngine):
                 },
                 anchor: 0.0,
             }, len(prompt)
-        peak = max(logits.values())
-        normalizer = peak + math.log(sum(math.exp(v - peak) for v in logits.values()))
-        return {token: value - normalizer for token, value in logits.items()}, len(
-            prompt
-        )
+        return conditional_logprobs(logits,output_ids),len(prompt)
 
     def distributions(
         self,
@@ -319,20 +272,20 @@ class RemoteVllmEngine(LetterEngine):
         standard = []
         groups = {}
         for index, row in enumerate(orders):
+            check_cancelled()
             if row.question.type == "labels" and len(row.options) > self.labels_capacity:
                 raise RequestError(
                     ["questions", row.id, "criteria"],
                     f"labels supports at most {self.labels_capacity} options",
                 )
-            ids = inference_ids(
-                self.tok, row, self.semantic, questions=questions,
+            ids = self.prompt_ids(
+                row, questions=questions,
+                first_row=first_rows[index] if first_rows else row,
                 questions_before_state=questions_before_state, read_twice=False,
                 analysis=(analyses or {}).get(row.id, ""),
             )
             if len(ids) + 1 > self.max_model_len:
-                raise RequestError(
-                    ["questions", row.id], "context limit exceeded; no truncation"
-                )
+                raise RequestError(["questions", row.id], CONTEXT_LIMIT)
             standard.append(ids)
             groups.setdefault(row.id, []).append(index)
 
@@ -345,8 +298,8 @@ class RemoteVllmEngine(LetterEngine):
                 if read_twice_max_input_tokens is not None and longest > read_twice_max_input_tokens:
                     reason = "input_threshold"
                 else:
-                    repeated = [inference_ids(
-                        self.tok, orders[i], self.semantic,
+                    repeated = [self.prompt_ids(
+                        orders[i],
                         first_row=first_rows[i] if first_rows else orders[i],
                         questions=questions, questions_before_state=questions_before_state,
                         read_twice=True, analysis=(analyses or {}).get(name, ""),
@@ -356,6 +309,8 @@ class RemoteVllmEngine(LetterEngine):
                         for i, ids in zip(indices, repeated, strict=True):
                             selected[i] = ids
                     else:
+                        if self.strict_read_twice_context:
+                            raise RequestError(["questions",name],CONTEXT_LIMIT)
                         reason = "context_limit"
             decisions[name] = reason
 
@@ -364,24 +319,20 @@ class RemoteVllmEngine(LetterEngine):
         for row, base, ids in zip(orders, standard, selected, strict=True):
             kind = row.question.type
             reason = decisions[row.id]
+            outputs = (
+                self.parking["option_ids"][:len(row.options)]
+                if kind == "labels" else answer_token_ids(self.tok, row, self.semantic)
+            )
             if variants is not None:
                 variants.append((row.id, {
                     "read_twice": reason == "applied",
                     "reason": reason,
                     "standard_input_tokens": len(base),
                     "input_tokens": len(ids),
+                    **self.read_metadata(outputs,ids),
                 }))
-            outputs = (
-                self.parking["option_ids"][:len(row.options)]
-                if kind == "labels" else answer_token_ids(self.tok, row, self.semantic)
-            )
             tasks.append((ids, list(outputs), kind))
-        # Each read runs in a copy of the request's context, so it sees the request id.
-        futures = [
-            self.pool.submit(contextvars.copy_context().run, self._read, *task)
-            for task in tasks
-        ]
-        results = [future.result() for future in futures]
+        results = self.read_tasks(tasks)
         return [table for table, _ in results], sum(tokens for _, tokens in results)
 
     def _evaluate_once(self, body, **kwargs):
@@ -406,6 +357,8 @@ class RemoteVllmEngine(LetterEngine):
                 }
                 if body.prompt_details:
                     answer["prompt"]["reads"] = reads
+        if not self.report_output_reads:
+            return result
         calls = 0
         seed = 0 if body.seed is None else body.seed
         for question in body.questions.values():
@@ -487,6 +440,10 @@ def install_backend_errors(app, error_format: str = "default"):
     @app.exception_handler(BackendReadError)
     async def backend_error(request, exc):
         log.warning("decision read failed: %s (cause: %r)", exc, exc.__cause__)
+        if isinstance(exc, BackendBusyError):
+            response = failure(request,503,BACKEND_UNAVAILABLE,str(exc))
+            response.headers["Retry-After"] = "1"
+            return response
         if isinstance(exc.__cause__, httpx.TimeoutException):
             return failure(request, 504, TIMEOUT, "vLLM did not answer in time")
         return failure(request, 502, BACKEND_UNAVAILABLE, str(exc))
@@ -495,12 +452,13 @@ def install_backend_errors(app, error_format: str = "default"):
 
 
 def build_remote_app(
-    engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default"
+    engine: RemoteVllmEngine, chat_model: str | None = None, error_format: str = "default",
+    *, max_requests: int | None = None, request_timeout: float = 300
 ):
     from fastapi.responses import JSONResponse, Response, StreamingResponse
     from starlette.background import BackgroundTask
 
-    app = build_app(engine, error_format)
+    app = build_app(engine, error_format, max_requests=max_requests, request_timeout=request_timeout)
     app.title = "SystemOne — choice, noul, score, labels"
     # Keep our typed /v1/systemone; forward the ordinary OpenAI API unchanged.
     app.router.routes[:] = [
