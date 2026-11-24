@@ -473,6 +473,47 @@ def connect_host(bind: str) -> str:
     return f"[{host}]" if ":" in host else host
 
 
+def native_commands(root, component, args):
+    """Explicit untouched-Llama profile; never auto-detect this for decision packages."""
+    if args.engine != "vllm":
+        raise ValueError("--native-tokens currently requires --engine vllm")
+    if args.bielik_tools_dir is not None:
+        raise ValueError("--bielik-tools-dir is not yet supported by --native-tokens")
+    cfg = json.loads((root / "config.json").read_text())
+    if cfg.get("model_type") != "llama" or cfg.get("architectures") != ["LlamaForCausalLM"]:
+        raise ValueError("native tokens require an original LlamaForCausalLM checkpoint")
+    if any((root / name).exists() for name in ("conversion.json", "heads.json", "adapter_config.json")):
+        raise ValueError("native tokens require original weights, not a decision package or adapter")
+    if component == "backend":
+        command = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", str(root),
+                   "--served-model-name", "base", "--host", args.backend_host,
+                   "--port", str(args.port or 8025), "--dtype", "bfloat16",
+                   "--max-model-len", "32768", "--max-logprobs", "128",
+                   "--logprobs-mode", "raw_logprobs", "--enable-prefix-caching",
+                   "--max-num-seqs", str(args.max_num_seqs or 8),
+                   "--max-num-batched-tokens", "2048", "--gpu-memory-utilization", "0.90"]
+        if args.fp8:
+            command += FP8
+        if args.kv_cache_gb is not None:
+            command += ["--kv-cache-memory-bytes", str(int(args.kv_cache_gb * 2**30))]
+        if args.eager:
+            command += ["--enforce-eager"]
+        return command, {"VLLM_PLUGINS": ""}
+    command = [sys.executable, "-m", "bielik_one.api.base_tokens", "--base-model", str(root),
+               "--backend-url", args.backend_url or f"http://{connect_host(args.backend_host)}:8025",
+               "--backend-model", "base", "--host", args.host, "--port", str(args.port or 8026),
+               "--workers", str(args.max_num_seqs or 8), "--decision-prefix", args.decision_prefix]
+    for flag, value in [("--queue-size", args.read_queue_size), ("--max-requests", args.max_requests),
+                        ("--backend-timeout", args.backend_timeout), ("--request-timeout", args.request_timeout)]:
+        if value is not None:
+            command += [flag, str(value)]
+    if args.max_body_mb is not None:
+        command += ["--max-body-mb", str(args.max_body_mb)]
+    if args.error_format:
+        command += ["--error-format", args.error_format]
+    return command, {}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="bielik-one",
@@ -484,6 +525,12 @@ def main(argv=None):
         "package",
         help="model package: a Hugging Face repo id (downloaded to the HF cache) or a local directory",
     )
+    p.add_argument("--read-queue-size", type=int, help="native frontend: queued reads beyond the worker pool (default: 64)")
+    p.add_argument("--max-requests", type=int, help="native frontend: active processing requests (default: 32)")
+    p.add_argument("--backend-timeout", type=float, help="native frontend: backend read timeout in seconds (default: 180)")
+    p.add_argument("--request-timeout", type=float, help="native frontend: processing deadline in seconds (default: 300)")
+    p.add_argument("--native-tokens", action="store_true", help="untouched Bielik 3.2: read original answer tokens; no adapter or heads")
+    p.add_argument("--decision-prefix", choices=["empty-think", "plain"], default="empty-think", help="native tokens only: assistant suffix (default: documented empty-think contract)")
     p.add_argument("--revision", help="revision of a Hugging Face repo id (default: main)")
     chat = p.add_mutually_exclusive_group()
     chat.add_argument(
@@ -614,10 +661,36 @@ def main(argv=None):
         p.error("--kv-cache-gb must be positive")
     if a.max_body_mb is not None and not (math.isfinite(a.max_body_mb) and a.max_body_mb * 2**20 >= 1):
         p.error("--max-body-mb must be a finite size of at least one byte")
+    limits = (a.read_queue_size, a.max_requests, a.backend_timeout, a.request_timeout)
+    if any(v is not None for v in limits) and (not a.native_tokens or a.component != "frontend"):
+        p.error("native request limits apply only to 'frontend --native-tokens'")
+    if a.read_queue_size is not None and not 0 <= a.read_queue_size <= 4096:
+        p.error("--read-queue-size must be between 0 and 4096")
+    if a.max_requests is not None and not 1 <= a.max_requests <= 256:
+        p.error("--max-requests must be between 1 and 256")
+    if any(v is not None and (not math.isfinite(v) or v <= 0) for v in (a.backend_timeout,a.request_timeout)):
+        p.error("native timeouts must be finite and positive")
     try:
         root = resolve_package(a.package, a.revision)
     except ValueError as exc:
         p.error(str(exc))
+    if a.native_tokens:
+        if a.component == "backend" and a.host not in LOOPBACK:
+            p.error("--host sets the frontend address; use --backend-host to bind the raw vLLM backend")
+        try:
+            command, extra = native_commands(root, a.component, a)
+        except (ValueError, FileNotFoundError) as exc:
+            p.error(str(exc))
+        launch_env = {**LAUNCH_ENV, **extra}
+        if a.shell:
+            print(shlex.join(["env", *(f"{k}={v}" for k,v in launch_env.items()), *command]))
+        elif a.dry_run:
+            print(json.dumps({"kind":"native-tokens", "command":command, "env":launch_env, "checksums_verified":False}, indent=2))
+        else:
+            os.execvpe(command[0], command, {**os.environ, **launch_env})
+        return 0
+    if a.decision_prefix != "empty-think":
+        p.error("--decision-prefix applies only to --native-tokens")
     try:
         verify(root)
         kind = detect(root)

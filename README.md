@@ -238,3 +238,61 @@ Thank you to everyone who contributes code, reports issues and helps improve Bie
 ## License
 
 Apache License 2.0, see `LICENSE`. Model weights are distributed separately under their own licenses.
+
+### Native answer-token decisions
+
+The explicit `--native-tokens` profile serves original Bielik 3.2 weights using
+existing answer tokens. It loads no LoRA, extra decision heads, vocabulary
+extension or heads plugin. Existing adapter and merged-package commands retain
+their behavior. Use vLLM 0.32.0 in the same environment as the launcher:
+
+```bash
+bielik-one backend /path/to/bielik-3.2 --native-tokens
+bielik-one frontend /path/to/bielik-3.2 --native-tokens
+```
+
+The backend serves `base` on loopback port 8025; the frontend exposes typed
+`/v1/systemone` requests as `decision` on port 8026 and proxies ordinary chat as
+`base`. One copy of GPU weights serves both routes. Native checkpoints need not
+contain decision-package checksum manifests; `--dry-run` reports
+`checksums_verified: false`. Pin the checkpoint revision for reproducibility.
+Keep the raw backend on loopback unless your network is trusted.
+
+Choice uses the existing training-label order: `A..Z`, `a..z`, followed by the
+uppercase pairs supported as single tokens by the tokenizer. The code uses at
+most 255 symbols. Reads exceeding 128 requested token IDs reuse the identical
+complete prompt in multiple requests; raw vocabulary logprobs are merged and
+normalized together. Usage counts every physical chunk prompt. Noul reads `no`
+and `yes`; score reads the digits of ordered levels. Labels always expand to
+independent noul questions, retaining the labels response format and a 0.5
+threshold. Label probabilities need not sum to one and the selected set may be
+empty. These probabilities are uncalibrated in this native profile.
+
+Native decisions use the supplied instructions in ChatML without a general-chat
+preamble. The default assistant suffix is `<think></think>`; frontend option
+`--decision-prefix plain` omits it. This reads answer probabilities, not generated
+reasoning or JSON. Ordinary chat retains the model's original template.
+
+Request fields `read_twice` and `read_twice_max_input_tokens` control repetition.
+Set `read_twice: true` with `read_twice_max_input_tokens: null` to repeat every
+input that fits the context. The threshold is decided once per question across
+candidate/permutation reads. Context overflow returns 422 without truncation.
+Answers report the effective prompt variant, reason and read counts;
+`prompt_details: true` includes read lengths and backend chunk counts.
+
+The shared read pool and queue are bounded across HTTP requests, including
+labels expansions. Defaults are 8 read workers, 64 queued reads, 32 active
+processing requests, a 180-second backend timeout and a 300-second processing
+deadline. Configure them on the native frontend with `--max-num-seqs`,
+`--read-queue-size`, `--max-requests`, `--backend-timeout` and `--request-timeout`.
+Admission overload returns 503 with `Retry-After: 1`; timeouts return 504.
+Disconnect cancellation stops queued/future reads; already running synchronous
+calls retain their slots until completion or timeout. Existing body limits and
+error formats apply. Native request-limit flags are rejected for other profiles.
+
+BF16 is the default. `--fp8` enables on-load FP8 with an unquantized lm_head.
+Prequantized FP8 checkpoints are detected by vLLM without this flag. Prefix
+caching is enabled; the default context is 32768. `--kv-cache-gb` and `--eager`
+remain available. FP8 can change probabilities and decisions, including under
+batching/cache changes. Transformers and vLLM BF16 can also differ numerically;
+backend agreement is not a benchmark accuracy result.

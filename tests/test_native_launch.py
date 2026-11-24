@@ -1,0 +1,60 @@
+import json
+import pytest
+from test_launch import dry
+
+
+def original(tmp_path):
+    (tmp_path/'config.json').write_text(json.dumps({'model_type':'llama','architectures':['LlamaForCausalLM']}))
+    return str(tmp_path)
+
+
+def test_native_backend_has_no_adapter_or_plugin(tmp_path):
+    result=dry('backend',original(tmp_path),'--native-tokens')
+    cmd=result['command']
+    assert result['kind']=='native-tokens' and result['checksums_verified'] is False
+    assert result['env']['VLLM_PLUGINS']==''
+    assert '--enable-lora' not in cmd and '--hf-overrides' not in cmd
+    assert cmd[cmd.index('--logprobs-mode')+1]=='raw_logprobs'
+
+
+def test_native_frontend_explicit_plain_suffix(tmp_path):
+    cmd=dry('frontend',original(tmp_path),'--native-tokens','--decision-prefix','plain','--max-num-seqs','12')['command']
+    assert 'bielik_one.api.base_tokens' in cmd
+    assert cmd[cmd.index('--decision-prefix')+1]=='plain'
+    assert cmd[cmd.index('--workers')+1]=='12'
+
+
+def test_native_profile_refuses_adapter_package(tmp_path):
+    root=original(tmp_path);(tmp_path/'heads.json').write_text('{}')
+    with pytest.raises(ValueError,match='original weights'):
+        dry('backend',root,'--native-tokens')
+
+
+def test_non_native_rejects_plain_suffix(tmp_path):
+    with pytest.raises(ValueError,match='only to --native-tokens'):
+        dry('frontend',original(tmp_path),'--decision-prefix','plain')
+
+
+def test_native_limits_forwarded_and_old_profiles_not_silently_affected(tmp_path):
+    root=original(tmp_path)
+    cmd=dry('frontend',root,'--native-tokens','--read-queue-size','10','--max-requests','4','--backend-timeout','30','--request-timeout','60')['command']
+    assert cmd[cmd.index('--queue-size')+1]=='10' and cmd[cmd.index('--max-requests')+1]=='4'
+    assert cmd[cmd.index('--backend-timeout')+1]=='30.0' and cmd[cmd.index('--request-timeout')+1]=='60.0'
+    with pytest.raises(ValueError,match='only to'):
+        dry('frontend',root,'--request-timeout','60')
+    with pytest.raises(ValueError,match='finite and positive'):
+        dry('frontend',root,'--native-tokens','--request-timeout','nan')
+
+
+def test_native_does_not_silently_ignore_newer_engine_flags(tmp_path):
+    root=original(tmp_path)
+    with pytest.raises(ValueError,match='requires --engine vllm'):
+        dry('backend',root,'--native-tokens','--engine','mlx')
+    with pytest.raises(ValueError,match='not yet supported'):
+        dry('backend',root,'--native-tokens','--bielik-tools-dir','/does/not/matter')
+
+
+def test_native_backend_accepts_opt_in_fp8(tmp_path):
+    cmd=dry('backend',original(tmp_path),'--native-tokens','--fp8')['command']
+    assert cmd[cmd.index('--quantization')+1]=='fp8_per_tensor'
+    assert json.loads(cmd[cmd.index('--quantization-config')+1])=={'ignore':['*lm_head*']}
