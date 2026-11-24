@@ -53,6 +53,9 @@ class BaseTokenEngine(RemoteVllmEngine):
 
     def per_option_probability(self,tables,token_ids,orders,temperature,yes):
         from bielik_one.api.server import score_orders,apply_temperature
+        # The published labels calibration was fitted on the serialized scalar
+        # P(yes), then transformed as [1-p, p]. Preserve that fitting contract,
+        # including float32 rounding; using the original pair changes the fit.
         prob=score_orders(tables,token_ids,orders,1.)[yes]
         return apply_temperature([1-prob,prob],temperature)[1]
 
