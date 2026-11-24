@@ -42,6 +42,7 @@ Environment:
   arrived on, with http://; required for --uds or TLS, e.g. https://<name in the certificate>:8000).
 - SYSTEMONE_SELF_CA: a CA bundle (PEM) that verifies the TLS certificate of SYSTEMONE_SELF_URL, when it is not
   signed by a CA in the system trust store (proxy variables are ignored for loopback reads).
+- SYSTEMONE_NATIVE_CALIBRATION: explicit native calibration file (default: beside model).
 - SYSTEMONE_NO_CALIBRATION=1: raw temperature-1 probabilities instead of the package's calibration.json.
 - SYSTEMONE_WORKERS: concurrent backend reads (default: the package's `bielik-one frontend` value, which matches its
   --max-num-seqs profile).
@@ -111,6 +112,7 @@ class Settings:
     max_requests: int = 32
     backend_timeout: float = 180
     request_timeout: float = 300
+    native_calibration: str | None = None
 
     @classmethod
     def from_env(cls, env=None) -> "Settings":
@@ -133,7 +135,7 @@ class Settings:
         except ValueError as exc:
             raise RuntimeError(f"SystemOne middleware: invalid SYSTEMONE_WORKERS or SYSTEMONE_MAX_BODY_MB ({exc})")
         settings = cls(
-            mode=mode,
+            mode=mode, native_calibration=env.get("SYSTEMONE_NATIVE_CALIBRATION") or None,
             public_name=public,
             lora_name=env.get("SYSTEMONE_LORA_NAME") or DEFAULT_LORA_NAME,
             package=root,
@@ -158,7 +160,7 @@ class Settings:
             raise RuntimeError("SYSTEMONE_WORKERS must be between 1 and 256")
         if not math.isfinite(settings.max_body_mb) or settings.max_body_mb * 2**20 < 1:
             raise RuntimeError("SYSTEMONE_MAX_BODY_MB must be finite and at least one byte")
-        native_options = ("SYSTEMONE_DECISION_PREFIX", "SYSTEMONE_READ_QUEUE_SIZE", "SYSTEMONE_MAX_REQUESTS",
+        native_options = ("SYSTEMONE_NATIVE_CALIBRATION", "SYSTEMONE_DECISION_PREFIX", "SYSTEMONE_READ_QUEUE_SIZE", "SYSTEMONE_MAX_REQUESTS",
                           "SYSTEMONE_BACKEND_TIMEOUT", "SYSTEMONE_REQUEST_TIMEOUT")
         if mode == "adapter" and any(name in env for name in native_options):
             raise RuntimeError("native request settings require SYSTEMONE_MODE=native")
@@ -258,6 +260,7 @@ def _build_native_engine(settings):
     import httpx
     from transformers import AutoTokenizer
     from bielik_one.api.base_tokens import BaseTokenEngine, VllmTokenReadout
+    from bielik_one.api.remote_vllm import resolve_calibration
 
     root = settings.package
     config = json.loads((root / "config.json").read_text())
@@ -282,6 +285,9 @@ def _build_native_engine(settings):
                                   queue_size=settings.queue_size, timeout=settings.backend_timeout, client=client)
         engine = BaseTokenEngine(tok, reader, model_name="unbound",
                                  empty_think=settings.decision_prefix == "empty-think")
+        if settings.native_calibration is not None and not settings.calibration:
+            raise ValueError('Explicit native calibration conflicts with disabled calibration')
+        engine.temperatures,engine.calibration_source=resolve_calibration(root/'config.json',settings.native_calibration,not settings.calibration)
     except BaseException:
         reader.close() if reader is not None else client.close()
         raise

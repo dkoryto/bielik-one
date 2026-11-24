@@ -507,6 +507,10 @@ def native_commands(root, component, args):
                         ("--backend-timeout", args.backend_timeout), ("--request-timeout", args.request_timeout)]:
         if value is not None:
             command += [flag, str(value)]
+    if args.no_calibration:
+        command += ["--no-calibration"]
+    if args.native_calibration is not None:
+        command += ["--calibration", str(args.native_calibration.resolve())]
     if args.max_body_mb is not None:
         command += ["--max-body-mb", str(args.max_body_mb)]
     if args.error_format:
@@ -525,6 +529,7 @@ def main(argv=None):
         "package",
         help="model package: a Hugging Face repo id (downloaded to the HF cache) or a local directory",
     )
+    p.add_argument("--native-calibration", type=Path, help="native frontend: explicit calibration JSON (default: beside model)")
     p.add_argument("--read-queue-size", type=int, help="native frontend: queued reads beyond the worker pool (default: 64)")
     p.add_argument("--max-requests", type=int, help="native frontend: active processing requests (default: 32)")
     p.add_argument("--backend-timeout", type=float, help="native frontend: backend read timeout in seconds (default: 180)")
@@ -661,6 +666,10 @@ def main(argv=None):
         p.error("--kv-cache-gb must be positive")
     if a.max_body_mb is not None and not (math.isfinite(a.max_body_mb) and a.max_body_mb * 2**20 >= 1):
         p.error("--max-body-mb must be a finite size of at least one byte")
+    if a.native_calibration is not None and (not a.native_tokens or a.component != "frontend"):
+        p.error("--native-calibration applies only to frontend --native-tokens")
+    if a.native_calibration is not None and a.no_calibration:
+        p.error("--native-calibration conflicts with --no-calibration")
     limits = (a.read_queue_size, a.max_requests, a.backend_timeout, a.request_timeout)
     if any(v is not None for v in limits) and (not a.native_tokens or a.component != "frontend"):
         p.error("native request limits apply only to 'frontend --native-tokens'")

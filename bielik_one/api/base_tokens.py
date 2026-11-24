@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from functools import lru_cache
-from bielik_one.api.remote_vllm import RemoteVllmEngine, build_remote_app
+from bielik_one.api.remote_vllm import RemoteVllmEngine, build_remote_app, resolve_calibration
 from bielik_one.api.vllm_reads import (
     VllmReadTransport as VllmTokenReadout, conditional_logprobs, check_cancelled,
 )
@@ -50,6 +51,17 @@ class BaseTokenEngine(RemoteVllmEngine):
             raise ValueError('Reasoning not supported by native base token readout')
         return decision_ids(self.tok,row,empty_think=self.empty_think,**kwargs)
 
+    def per_option_probability(self,tables,token_ids,orders,temperature,yes):
+        from bielik_one.api.server import score_orders,apply_temperature
+        # The published labels calibration was fitted on the serialized scalar
+        # P(yes), then transformed as [1-p, p]. Preserve that fitting contract,
+        # including float32 rounding; using the original pair changes the fit.
+        prob=score_orders(tables,token_ids,orders,1.)[yes]
+        return apply_temperature([1-prob,prob],temperature)[1]
+
+    def per_option_temperature_kind(self,row):
+        return "labels" if row.question.type=="labels" else "noul"
+
     def evaluate(self,body):
         body=body.model_copy(update={'questions':{
             key:q.model_copy(update={'mode':'per_option'}) if q.type=='labels' else q
@@ -77,6 +89,8 @@ def main():
     from bielik_one.api.http_guard import add_guard_arguments, guarded
     p=argparse.ArgumentParser(description=__doc__)
     add_guard_arguments(p)
+    from bielik_one.api.remote_vllm import add_calibration_arguments
+    add_calibration_arguments(p)
     p.add_argument('--workers',type=int,default=8)
     p.add_argument('--queue-size',type=int,default=64)
     p.add_argument('--max-requests',type=int,default=32)
@@ -93,6 +107,12 @@ def main():
     if any(not math.isfinite(v) or v <= 0 for v in (a.backend_timeout,a.request_timeout)): p.error('timeouts must be finite and positive')
     tok=AutoTokenizer.from_pretrained(a.base_model,local_files_only=True)
     engine=BaseTokenEngine(tok,VllmTokenReadout(a.backend_url,a.backend_model,workers=a.workers,queue_size=a.queue_size,timeout=a.backend_timeout),model_name=a.model_name,max_model_len=a.max_model_len,empty_think=a.decision_prefix=='empty-think')
+    try:
+        if a.calibration is not None and a.no_calibration:
+            raise ValueError('Explicit calibration conflicts with disabled calibration')
+        engine.temperatures,engine.calibration_source=resolve_calibration(Path(a.base_model)/'config.json',a.calibration,a.no_calibration)
+    except (ValueError,OSError) as exc:
+        engine.close();p.error(str(exc))
     engine.backend_url=a.backend_url.rstrip('/')
     uvicorn.run(guarded(build_remote_app(engine,chat_model=a.backend_model,error_format=a.error_format,max_requests=a.max_requests,request_timeout=a.request_timeout),a.max_body_mb,a.error_format),host=a.host,port=a.port)
 

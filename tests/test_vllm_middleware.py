@@ -711,3 +711,26 @@ def test_native_middleware_accepts_prequantized_fp8_only():
     app.state.vllm_config.model_config.hf_config=model.hf_config
     with TestClient(app):
         assert engine.max_model_len==32768
+
+
+@pytest.mark.parametrize('disabled,explicit',[(False,False),(True,False),(False,True)])
+def test_native_middleware_loads_model_calibration(tmp_path,monkeypatch,disabled,explicit):
+    from transformers import AutoTokenizer
+    from test_base_tokens import Tok
+    monkeypatch.delenv('SYSTEMONE_HEADS_MANIFEST',raising=False)
+    monkeypatch.setattr(AutoTokenizer,'from_pretrained',lambda *a,**kw:Tok())
+    (tmp_path/'config.json').write_text(json.dumps({'model_type':'llama','architectures':['LlamaForCausalLM']}))
+    default=tmp_path/'calibration.json';custom=tmp_path/'custom.json'
+    for path,t in [(default,2),(custom,3)]:
+        path.write_text(json.dumps({'temperatures':dict(choice=t,binary=t,score=t,labels=t)}))
+    settings=middleware.Settings(package=tmp_path,mode='native',calibration=not disabled,
+                                 native_calibration=str(custom) if explicit else None)
+    engine=middleware.build_engine(settings)
+    try:
+        if disabled:
+            assert engine.temperatures=={} and engine.calibration_source is None
+        else:
+            assert engine.temperatures['1']['labels']==(3 if explicit else 2)
+            assert engine.calibration_source==str(custom if explicit else default)
+    finally:
+        engine.close()
