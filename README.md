@@ -1,406 +1,159 @@
-# bielik-one
+# Bielik One
 
-Typed decision API and launcher for the Bielik One decision models served with vLLM: Bielik-One-11B-v3.0-r1, Bielik-One-11B-v3.1-r1, Bielik-One-7B-v3.0-r1 and Bielik-One-4B-r1, each as an adapter package (`-Adapter`) and as a merged export.
+**Turn text into decisions with probabilities.** Serve Bielik One models through
+one typed API, alongside ordinary OpenAI-compatible chat.
 
-The API answers four question types about a textual state — `choice`, `noul` (binary), `score` and `labels` — with probabilities, in one forward pass per question. **`labels` is native multi-label classification:** a dedicated labels head scores all listed options together and gives each an independent probability; it is not emulated as a series of `noul` questions, one per option (that protocol is available on request with `"mode": "per_option"`, see below). Model weights live in the Hugging Face repositories; this repository holds the code that serves them.
+Ask a question about a document, message or other textual state:
 
-## Install
+- **`choice`** — choose one option.
+- **`noul`** — estimate the probability of yes.
+- **`score`** — rate the state on an ordered scale.
+- **`labels`** — select any number of options, each with its own probability.
 
-Python 3.12 and an NVIDIA GPU (adapter packages also run on Apple silicon, see [Apple silicon (MLX)](#apple-silicon-mlx)). In a fresh environment:
+The decision API reads model outputs directly instead of generating and parsing
+JSON. This repository contains the launcher and serving runtime; model weights
+are hosted separately on Hugging Face.
+
+[Quick start](#quick-start) · [Models](#models-and-serving-options) · [API reference](docs/api.md) · [Deployment](docs/serving.md#deployment-and-untrusted-text)
+
+## Quick start
+
+Requires **Python 3.12+**, an **NVIDIA GPU** and **vLLM 0.32.0**.
+The 11B BF16 example below needs about **30 GB of GPU memory**. For smaller
+GPUs, see [FP8 and memory settings](docs/serving.md#gpu-memory-and-performance).
+For Apple silicon, see the [MLX guide](docs/serving.md#apple-silicon-mlx).
+
+### 1. Install
 
 ```bash
 pip install "bielik-one[vllm] @ git+https://github.com/speakleash/bielik-one"
-# only for adapter packages (*-Adapter): the decision-heads plugin
-pip install --no-deps "systemone-vllm-heads @ git+https://github.com/speakleash/bielik-one#subdirectory=vllm-heads-plugin"
 ```
 
-## Run
+### 2. Start the model and API
 
-Start the backend and, in a second terminal, the API, with the model's Hugging Face repo id:
+Run these in separate terminals. The model downloads to the Hugging Face cache
+on first use; a local model directory works too.
 
 ```bash
+# Terminal 1: GPU backend
 bielik-one backend speakleash/Bielik-One-11B-v3.0-r1
+```
+
+```bash
+# Terminal 2: HTTP API
 bielik-one frontend speakleash/Bielik-One-11B-v3.0-r1
 ```
 
-The package is downloaded to the Hugging Face cache on first use (`--revision` pins a commit). A local directory, for example from `hf download ... --local-dir model`, works the same: `bielik-one backend model`. `bielik-one backend <package> --dry-run` verifies the published runtime checksums and prints the exact vLLM command. Startup verification skips the root-level `README.md`, `LICENSE`, `.gitattributes` and `requirements.txt`, so editing or omitting these auxiliary files does not block inference. All other manifest entries, including every weight file, remain fully verified for both the backend and frontend. The launcher detects the package type and uses the profile validated for it:
+The API listens on **http://127.0.0.1:8026**. Interactive API docs are at
+[/docs](http://127.0.0.1:8026/docs); readiness is at
+[/health](http://127.0.0.1:8026/health).
 
-| Package | Backend | API |
-|---|---|---|
-| `Bielik-One-11B-v3.0-r1-Adapter`, `Bielik-One-11B-v3.1-r1-Adapter`, `Bielik-One-7B-v3.0-r1-Adapter` | vLLM + LoRA + heads plugin | `http://127.0.0.1:8026` |
-| `Bielik-One-11B-v3.0-r1`, `Bielik-One-11B-v3.1-r1`, `Bielik-One-7B-v3.0-r1` | stock vLLM | `http://127.0.0.1:8026` |
-| `Bielik-One-4B-r1-Adapter` | vLLM + LoRA + heads plugin | `http://127.0.0.1:8012` |
-| `Bielik-One-4B-r1` | stock vLLM | `http://127.0.0.1:8012` |
-
-**Adapter packages are a small add-on.** They share the unchanged base weights, so if you already serve the base model (for example `speakleash/Bielik-11B-v3.0-Instruct`) with vLLM, adding a decision adapter costs only its LoRA weights and heads: about 1.0 GB for the 11B models, 1.4 GB for the 7B model and 0.7 GB for the 4B model. The same engine keeps serving ordinary chat with the original base model. Merged packages need their own full copy of the weights.
-
-The backend runs in **bfloat16** by default, the precision of all reported results and of the calibration. An 11B model then needs about 30 GB of GPU memory (weights plus the configured KV cache), a 7B model about 22 GB and the 4B model about 12 GB. On smaller GPUs add `--fp8` (on-load FP8 weight quantization, BF16 language-model head): it roughly halves weight memory and raises throughput (1.4x measured for the 4B model), but changes 2-18% of decisions near the decision boundary depending on model and question type, and the calibration was not fitted for it. The backend uses CUDA graphs, which speed up chat generation and leave decisions unchanged; `--eager` turns them off for a shorter start or if graphs cause problems on a GPU. For many concurrent users, `--max-num-seqs N` (pass it to both the backend and the frontend) and `--kv-cache-gb GB` raise the validated profile, for example `--max-num-seqs 32 --kv-cache-gb 4` for `Bielik-One-4B-r1` (about 14 GB of GPU memory instead of 10.5 GB). For throughput, send all questions about one state in one request: the state is read once and the other questions reuse the prefix cache. Use `--port` / `--backend-url` to move ports.
+### 3. Ask a question
 
 ```bash
-curl -s localhost:8026/v1/systemone -H 'Content-Type: application/json' -d '{
-  "model": "decision",
-  "state": "Invoice 12/2026 for EUR 4,300 has not been paid. The payment deadline passed yesterday. The customer has paid late twice this year.",
-  "questions": {
-    "status": {
-      "type": "choice",
-      "instructions": "What is the status of the invoice?",
-      "criteria": {
-        "paid": "Paid",
-        "overdue": "Unpaid and past the deadline",
-        "not_due": "Unpaid, deadline not reached"
-      }
-    },
-    "late": {
-      "type": "noul",
-      "instructions": "Has the payment deadline passed?",
-      "criteria": {
-        "true": "Yes",
-        "false": "No"
-      }
-    },
-    "urgency": {
-      "type": "score",
-      "instructions": "How urgent is collection?",
-      "criteria": [
-        "none",
-        "low",
-        "medium",
-        "high",
-        "critical"
-      ]
-    },
-    "actions": {
-      "type": "labels",
-      "instructions": "Which actions are appropriate now?",
-      "criteria": {
-        "reminder": "Send a payment reminder",
-        "interest": "Charge late-payment interest",
-        "cancel": "Cancel the invoice"
+curl http://127.0.0.1:8026/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "decision",
+    "state": "The invoice is unpaid. Its payment deadline was yesterday.",
+    "questions": {
+      "status": {
+        "type": "choice",
+        "instructions": "What is the status of this invoice?",
+        "criteria": {
+          "paid": "Paid",
+          "overdue": "Unpaid and past the deadline",
+          "not_due": "Unpaid, deadline not reached"
+        }
       }
     }
-  }
-}'
+  }'
 ```
 
-Answers, keyed by question name: `choice` gives the chosen key, `probabilities` and `confidence`; `noul` the probability of yes, `probabilities` (`true`, `false`) and `confidence`; `score` the expected level (0-based over the listed levels), `probabilities` per level, `legend` and `confidence`; `labels` an independent probability per option and the `selected` keys (probability >= 0.5), all from the native labels head, and `confidence`.
+The answer contains the selected option, probabilities and confidence. Put
+several questions about the same state in one request to reuse cached prefixes.
+See the [API reference](docs/api.md) for all four types and response fields.
 
-`confidence` uses the formulas of the reference System One implementation (Hugging Face Transformers' decision pipeline, llama.cpp), so the same request gets the same `confidence` on any System One server. It says how concentrated the distribution is; it is not the probability that the answer is right, which is the chosen answer's entry in `probabilities` (calibrated, see [Calibration](#calibration)):
-- `choice`: (p_max - 1/K) / (1 - 1/K) for K options: 0 for a uniform distribution, 1 when one option has all the probability;
-- `noul`: the same formula over its two sides, |2p - 1|;
-- `score`: 1 - d / d_u, where d is the expected distance (in levels) from the most probable level and d_u the same for a uniform distribution from the middle of the scale, so a near miss counts less than a far one (floored at 0);
-- `labels` (not a reference type): the probability that the selected set is exactly right, the product over the options of the probability of each option's decision.
+## Models and serving options
 
-A `labels` question takes an optional `"mode"`. `"head"` (the default) reads every option in one pass from the labels head. `"per_option"` asks one `noul` question per option, each showing the question, all options and one candidate (`Candidate: <key>: <text>` / `Does this candidate belong to the correct answer set?`), and returns the same `labels` answer with `"mode": "per_option"`. For Bielik-One-4B-r1 (bfloat16, through this API, on the multilabel questions of the native test split) it raises exact-set accuracy by 6.0 percentage points and set F1 by 1.0 point; the effect differs by model. It costs one read per option (4.4 on average there), about 2.5 times the time per question. Each option is a `noul` decision, so it uses the `noul` calibration temperature and the 0.5 threshold; a request `temperature` applies if it is a number or has a `noul` entry (a mapping without `noul` means temperature 1, as for any type it does not name). There is no separately fitted temperature for this mode. It works with every package, including those without a labels head. `"mode"` takes only `"head"` or `"per_option"` and is rejected on other question types (it was ignored before 1.0.5). A request may make at most 1024 decision reads in all (questions x option orders, one per option and at most two orders each for per-option labels), and the text that per-option prompts repeat is capped at 2 million characters per request; both are checked before anything is sent to vLLM.
+Published decision models:
 
-`"facts": true` (default `false`) adds deterministic preprocessing for questions that depend on exact arithmetic: dates and deadlines, day counts, amounts against thresholds. A one-pass decision cannot reliably count the days between two dates or add up a list of amounts; with `facts` the API computes such facts in code from the state and the question instructions and appends them to the state, under a one-line header, before the model reads it. Code computes, the model decides:
-- every date of the state with its weekday, and its distance from today when the state gives today's date; days between the dates (also counting both days, and in working days Monday-Friday without the days off the text names when the text speaks of working days), with full months and years for long spans; clock time between dated times;
-- date + duration for the durations in the instructions ("within 30 days", "10 working days", "the 14th day", "3 years"), month ranges such as `09.2019 - 08.2021` or `03.2020 - present`;
-- sums of amounts with the same unit (currency, %, MB, kg, hours, ...) in one sentence, in a list and in the list lines with the same description, an amount per person when the rule speaks of one, and comparisons with the thresholds of the same unit in the instructions, as symbols (`512,40 zł > 500 zł`);
-- whether the state contains a bank account number, an e-mail address or a postal code, when the instructions ask for one.
+- [Bielik One 11B v3.0](https://huggingface.co/speakleash/Bielik-One-11B-v3.0-r1)
+- [Bielik One 11B v3.1](https://huggingface.co/speakleash/Bielik-One-11B-v3.1-r1)
+- [Bielik One 7B](https://huggingface.co/speakleash/Bielik-One-7B-v3.0-r1)
+- [Bielik One 4B](https://huggingface.co/speakleash/Bielik-One-4B-r1)
 
-Only arithmetic and calendar facts are added, never a verdict ("the deadline is met", "the limit is exceeded"): which fact matters and how the rule counts stays the model's decision. Polish, English, German and Norwegian Bokmål are recognised (the facts are written in the request's language, detected from the text). Numbers are read in the convention of that language when their separators alone do not decide (`12.500` is 12500 in Polish, German and Norwegian text; `12,500` is 12500 in English text); with both `.` and `,` the last one is the decimal separator, and an amount of money whose separator could be either (`12,500 zł` in Polish text, `£12.500` in English text) is left out rather than guessed. The response then has `"facts": {"language": ..., "lines": [...]}`; a request without facts to compute is sent unchanged. The facts are part of the state, so with read twice they are repeated with it and count toward `read_twice_max_input_tokens` and the context; when the standard prompt with them would exceed the context, the request is read without them (`"lines": []`). Without `facts` the prompt is unchanged. The models were not trained with the block; see [Benchmarking](#benchmarking) for its measured effect. The code is `bielik_one/prompting/facts.py`.
+Each has a **merged** export and a **`-Adapter`** package. The launcher detects
+the package type. The 11B and 7B frontends default to port **8026**; 4B uses **8012**.
 
-Errors have one shape, `{"error": "<message>", "code": "<CODE>"}`, with `detail` (the field locations) on a 422. The codes:
-- `INVALID_REQUEST` (422): the request must be changed, including a body that is not valid JSON;
-- `PAYLOAD_TOO_LARGE` (413);
-- `NOT_FOUND` (404) and `METHOD_NOT_ALLOWED` (405);
-- `BACKEND_UNAVAILABLE` (502; 503 on `/health`) and `TIMEOUT` (504), when vLLM does not answer or not in time;
-- `INTERNAL_ERROR` (500).
+**Merged model:** use the quick-start commands with the model's repo ID. No heads
+plugin is needed.
 
-The chat routes answer errors in the OpenAI format, `{"error": {"message", "type", "param", "code"}}`, as vLLM itself does there. `bielik-one frontend ... --error-format openai` uses that format on every route except `/health`, which keeps `{"status", "error", "code"}` for load-balancer probes.
+**LoRA adapter:** use the corresponding `-Adapter` repo and install the
+[decision-heads plugin](docs/serving.md#adapter-and-merged-packages). One copy of
+the original base weights serves both chat and decisions; the adapter is selected
+only for decisions.
 
-Ordinary chat and completions go to `/v1/chat/completions` and `/v1/completions` on the same port, with the package's chat model alias (listed by `/v1/models`, e.g. `bielik-base`, `qwen-base` or `qwen-general`; requests without a model get it); the `decision` model is rejected there. Interactive docs: `/docs`.
-
-### Tools and reasoning for Bielik adapter chat
-
-To enable the ordinary chat model's tool-call and reasoning parsers on vLLM 0.32.0, point the backend at a local [bielik-tools](https://github.com/speakleash/bielik-tools) checkout compatible with that vLLM version:
-
-```bash
-bielik-one backend speakleash/Bielik-One-11B-v3.1-r1-Adapter \
-  --bielik-tools-dir /opt/bielik-tools --dry-run
-# Remove --dry-run to start the backend; start bielik-one frontend as usual.
-```
-
-This enables `--enable-auto-tool-choice`, both `bielik` parsers via `--tool-parser-plugin` / `--reasoning-parser-plugin`, and `--exclude-tools-when-tool-choice-none`. The directory is the repository root containing `tools/`, not `tools/` itself. The launcher checks that the required files exist and passes absolute paths, so it also works from another working directory or a pip installation. Parser code runs inside vLLM: use a trusted checkout pinned to a revision you have tested. No parser files are copied, downloaded or updated by bielik-one.
-
-Supported adapter bases are `speakleash/Bielik-11B-v3.1-Instruct`, `speakleash/Bielik-11B-v3.0-Instruct` and `speakleash/Bielik-Minitron-7B-v3.0-Instruct`. Bielik 3.1 keeps the base checkpoint's chat template; request thinking with `chat_template_kwargs={"reasoning_effort": "medium"}` (or `none`, `low`, `high`, `max`). The two 3.0 bases use upstream `tools/bielik_advanced_chat_template.jinja` for chat; request thinking with `chat_template_kwargs={"enable_thinking": true}` and `skip_special_tokens: false`. The package's pinned **decision** template and token rendering stay separate. Parser setup does not establish model quality or GPU parity.
-
-Alternatively set `BIELIK_TOOLS_DIR=/opt/bielik-tools`. An explicit `--bielik-tools-dir` overrides it; `--no-bielik-chat-parsers` disables it for one backend invocation. With neither configured, the command stays unchanged. The environment variable is only used by the vLLM backend, so the frontend and MLX ignore it; explicit parser options on those commands are rejected. Configuring the directory for an unsupported base, Qwen or a merged package is rejected. For custom parser/template flags, use `--no-bielik-chat-parsers --shell` and edit the printed vLLM command to avoid duplicate flags. Both `--shell` and `--dry-run` include the configured parser flags; the same printed command can be used with the single-server middleware below.
-
-## Running vLLM yourself
-
-`bielik-one backend` only verifies the package and starts an ordinary `vllm serve` with a validated set of flags; the decisions are computed by `bielik-one frontend`. To run vLLM under your own process manager or container, print the exact command and start it yourself:
-
-```bash
-bielik-one backend <package> --shell     # one line: env VAR=... python -m vllm.entrypoints.cli.main serve ...
-bielik-one backend <package> --dry-run   # the same as JSON: "command" and "env"
-bielik-one frontend <package> --backend-url http://127.0.0.1:<port>
-```
-
-Both verify the checksums and start nothing. `--port`, `--backend-host`, `--max-num-seqs`, `--kv-cache-gb`, `--eager` and `--fp8` are reflected in the printed command.
-
-Requirements: vLLM 0.32.0, and for `*-Adapter` packages the `systemone-vllm-heads` plugin installed in the same environment.
-
-Keep these as printed, because the decision reads depend on them:
-- the environment: `VLLM_PLUGINS` and `SYSTEMONE_HEADS_MANIFEST` (adapter packages), `VLLM_MAX_NUM_BAD_WORDS` (merged packages) and `VLLM_USE_V2_MODEL_RUNNER=0`;
-- the model, its `--revision` and `--hf-overrides` architecture; the LoRA module name `decision` and its rank and target modules;
-- `--served-model-name` (the frontend addresses these aliases);
-- `--max-logprobs 256` and `--logprobs-mode processed_logprobs`;
-- `--dtype bfloat16` and `--max-model-len 32768` (the calibration and the reported results are bfloat16, with no truncation).
-
-Free to change for your hardware and load: `--host`, `--port`, `--gpu-memory-utilization`, `--kv-cache-memory-bytes`, `--max-num-seqs` (pass the same value to the frontend), `--max-num-batched-tokens`, `--enforce-eager`, and general vLLM options such as logging. Do not set `--api-key`: the frontend does not send one. Keep the backend on a private network instead; it accepts internal decision flags.
-
-The frontend checks every read: a backend started without the required logprob settings is refused with an error instead of returning wrong probabilities. After starting both, `curl <frontend>/health` should report `"status": "ok"` and `"calibrated": true`.
-
-### Single-server middleware (adapter packages)
-
-The middleware contributed by [Filip Reka](https://github.com/FIlipHand) adds `/v1/systemone` to the same vLLM server as chat, without a separate frontend process. It supports `*-Adapter` packages and uses the existing decision engine, calibration and package checks, including weight checksums.
-
-Use a downloaded adapter package and print the validated backend command:
-
-```bash
-export SYSTEMONE_PACKAGE=/path/to/adapter-package
-bielik-one backend "$SYSTEMONE_PACKAGE" --shell
-```
-
-Run the printed command with `--middleware bielik_one.api.vllm_middleware.SystemOneMiddleware` appended. Keep its printed environment and model/LoRA flags, including `SYSTEMONE_HEADS_MANIFEST`. Do not start `bielik-one frontend` for this mode. vLLM 0.32 has its own `POST /v1/systemone` (generic structured decisions, disabled for the SystemOne architectures); the middleware replaces that route. Both chat and decisions use the base model's public served name (for example `bielik-base`); the internal `decision` LoRA name is hidden from `/v1/models` and rejected in public requests; SageMaker adapter headers and vLLM's runtime LoRA management routes are refused for clients, so the adapter cannot be selected, unloaded or loaded again under another name. If you register the adapter under a different `--lora-modules` name, set `SYSTEMONE_LORA_NAME` to it.
-
-Decisions use vLLM's own authentication and CORS middleware, including API keys configured through `--api-key`, its config-file equivalent or `VLLM_API_KEY`. `SYSTEMONE_MAX_BODY_MB` limits decision and public request bodies except form uploads (default 16 MiB). With `--api-server-count` above 1 (vLLM's default with `--data-parallel-size` above 1), set the same secret `SYSTEMONE_INTERNAL_TOKEN` in each process; the server refuses to start without it. For TLS, Unix sockets or a different loopback address, set `SYSTEMONE_SELF_URL` explicitly (with TLS, use a host name in the certificate, and `SYSTEMONE_SELF_CA=/path/ca.pem` when the certificate is not signed by a system-trusted CA). See the middleware module's docstring for all settings.
-
-Use `GET /v1/systemone/health` as the readiness check of decisions: it answers 200 with the served model names and calibration once decisions work, and 503 (or 500 for a missing setting) with the reason otherwise; it is under `/v1`, so it needs the API key when one is set. vLLM's own `/health` only reports the engine. After deploying, `python scripts/check_middleware.py --url <server> --api-key <key> --model <served name>` checks decisions, the readiness route, authentication and the LoRA and backend-flag filters, and exits non-zero on any failure. vLLM's API key guards only paths under `/v1`: `/invocations`, `/health`, `/metrics` and its other routes stay open, as in plain vLLM, so restrict them in a reverse proxy before exposing the port.
-
-## Apple silicon (MLX)
-
-On a Mac with Apple silicon, adapter packages run on [MLX](https://github.com/ml-explore/mlx) instead of vLLM. As with the vLLM adapter backend, one copy of the base model serves both ordinary chat (adapter off) and the decisions (LoRA and decision heads on), chosen per request:
-
-```bash
-pip install "bielik-one[mlx] @ git+https://github.com/speakleash/bielik-one"
-bielik-one backend speakleash/Bielik-One-4B-r1-Adapter --engine mlx
-bielik-one frontend speakleash/Bielik-One-4B-r1-Adapter
-```
-
-The frontend is the same as for vLLM, and so are the API, the ports and the model names. The backend (`bielik_one/mlx_backend.py`) answers the requests the frontend sends to vLLM: one-token reads under `decision` with the LoRA on and the decision heads (float32) as logits, and generation by the unchanged base model under the base alias (`qwen-base`, `bielik-base`) on `/v1/chat/completions` and `/v1/completions`, streaming or not. The LoRA is not merged into the base weights; it is switched on only while a decision read runs. One forward pass runs at a time; a chat generation releases the GPU between tokens, so decisions are not blocked by a long answer. Generation takes `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_tokens` and `stop`; the vLLM parameters it does not implement (`frequency_penalty`, `presence_penalty`, `repetition_penalty`, `min_tokens`, `ignore_eos`, `logit_bias`, `bad_words`, `stop_token_ids`, `allowed_token_ids`, `n` > 1) are refused with a 400 unless they have their neutral value, rather than silently ignored.
-
-The base model is the repository and revision the package pins (`heads.json`, `serving.json`). It is downloaded to the Hugging Face cache, or taken from a local directory with `--base DIR` (for example from `hf download <base repo> --revision <pinned revision> --local-dir DIR`). Its weights, config and tokenizer files are checked against the Hub's checksums of the pinned revision before loading, and such files the pinned revision does not have (an extra `model*.safetensors` or `chat_template.jinja`, for example) are refused; `--skip-base-check` skips this (offline use), with a warning. `--cache-limit-gb` caps the MLX buffer cache (default 4). `--dry-run`, `--port` and `--backend-host` work as for vLLM; the vLLM options (`--fp8`, `--eager`, `--max-num-seqs`, `--kv-cache-gb`) are refused. Merged packages are not supported by the MLX backend; their weights would need a conversion first.
-
-Pinned versions: `mlx==0.32.4`, `mlx-lm==0.32.2`, bfloat16 weights. On 600 public validation-style questions (Tacit dev, 4 languages, `choice`/`noul`/`score`, raw probabilities), Bielik-One-4B-r1 on this backend agreed with the merged package converted to MLX on 99.3% of decisions (accuracy 91.7% vs 91.3%), using 8.2 GiB of weights for chat and decisions together instead of two models. With the same prompts on both sides, decisions agreed with the vLLM adapter backend on 99.5% (4B), 99.3% (11B-v3.0) and 99.5% (11B-v3.1). Greedy chat is token-identical to plain `mlx_lm` generation with the base model.
-
-## Deployment and untrusted text
-
-Both processes bind to `127.0.0.1` by default. `--host` moves only the frontend (typed API and chat proxy); the raw vLLM backend stays on loopback unless you pass `--backend-host`, because it accepts internal decision flags. The separate frontend has no authentication: to expose it, put it behind a reverse proxy that authenticates clients. Requests are limited to 64 questions, 16 permutations, 400,000 characters of state and 400,000 characters of questions. The frontend refuses a body larger than 16 MiB with HTTP 413 before reading it whole (`--max-body-mb` on `bielik-one frontend` changes it); text that is not valid Unicode (a lone UTF-16 surrogate such as `"\udead"`) is refused with 422. Every response carries an `x-request-id` header: the client's `X-Request-Id` when it is 1-128 characters of letters, digits and `._:-`, otherwise a generated one. The frontend logs it with failed requests and sends it, with a suffix per call, to the vLLM backend. If the backend binds a specific address with `--backend-host`, start the frontend with the same `--backend-host` (or `--backend-url`).
-
-The state, instructions and option texts are data for the model, not instructions to the server. Text that spells a tokenizer control or tag token (for example `<|im_end|>` or `</think>`) is neutralized before tokenization, so it stays plain text and cannot end the user turn; all other text is passed exactly as sent, in the prompt format used in training. A decision about adversarial text (for example a document written to steer the answer) is still a model output about that text, not a guarantee.
-
-## Calibration
-
-Each model repository ships `calibration.json`: one temperature per question type, fitted on validation data only. The API applies it by default in every request mode: any number of option orders, `read_twice` and `questions_before_state`. The temperatures were fitted for one option order on the standard prompt, and they carry over: for read-twice prompts and FP8 serving, temperatures refitted for those settings lowered test NLL by at most 0.012 against the shipped ones (Bielik-One-11B-v3.0-r1, Bielik-One-7B-v3.0-r1 and Bielik-One-4B-r1 for read-twice; these and Bielik-One-11B-v3.1-r1 for FP8). With 2 or 4 option orders and with `questions_before_state` the shipped temperatures gave a lower NLL than raw probabilities for every categorical type in a check on native validation (Bielik-One-4B-r1); a temperature fitted for `questions_before_state` would be somewhat higher. Calibration never changes argmax or 0.5-threshold decisions; the `score` field is the expected level and does change. Raw probabilities: start the API with `--no-calibration`, or send `"temperature": 1`. `/health` reports whether calibration is active. The temperatures were fitted on bfloat16 outputs with the standard prompt.
-
-## Benchmarking
-
-The request options below change the numbers you get, so a result is only meaningful together with the settings it was measured with. Report them, and when you compare with another decision model, match its settings instead of comparing defaults: if that model reads the input twice or averages two option orders by default, run these models the same way too.
-
-- **Reference profile.** bfloat16, one option order (`permutations: 1`), `read_twice: false`, `questions_before_state: false`, labels in `"mode": "head"`. This is the setting of the results on the model cards.
-- **Probabilities.** Calibration does not change any decision, so accuracy is the same with and without it. For probability metrics (NLL, Brier, ECE, KL) say which you used: the calibrated default, or raw with `"temperature": 1`. Calibration applies in every mode (see [Calibration](#calibration)), so raw probabilities need `"temperature": 1` explicitly.
-- **Labels.** `"mode": "head"` reads all options in one pass. `"mode": "per_option"` asks one yes/no question per option, which is how decision models without a multi-label head answer such questions, so use it when comparing with them. For Bielik-One-4B-r1 it raises exact-set accuracy by 6.0 percentage points on the native test split, at one read per option.
-- **Read twice (default).** `"read_twice": true` repeats the input when the complete standard prompt has at most `read_twice_max_input_tokens` tokens (default **4096**, before repetition). Longer prompts use the standard input. Set `"read_twice": false` to disable it, or `"read_twice_max_input_tokens": null` to remove the length threshold. The exact repeated prompt plus one output token must always fit the server context; otherwise the standard prompt is used. If the standard prompt also exceeds context, the request fails without truncation. Each answer includes a compact `prompt` object: `variant` (`"standard"` or `"read_twice"`), `requested_read_twice`, `reason`, the effective `read_twice_max_input_tokens`, `max_context_tokens`, and read counts. Send `"prompt_details": true` for the per-read token lengths. The choice is made once per question: all permutations and all per-option label reads must meet the threshold and fit context, otherwise all use the standard prompt. For `choice`, `labels`, and any non-semantic readout, both copies use the same current permutation, so each letter always denotes the same option within a prompt. Only semantic `noul` and `score` keep the original order in the first copy for a shared KV-cache prefix; the second copy is permuted while `yes`/`no` and score digits retain their meanings. This semantic fixed-prefix multi-permutation variant has not yet been rebenchmarked for quality. This changes the behavior of requests that omit `read_twice`; reference benchmark requests must explicitly send `false`. The 4096 threshold is a provisional cost/accuracy tradeoff from 4B native validation, not a validated optimum for every model. Earlier unrestricted read-twice measurements raised single-choice accuracy on the native test split by 3.5 percentage points (Bielik-One-11B-v3.0-r1), 3.3 (Bielik-One-7B-v3.0-r1) and 1.5 (Bielik-One-4B-r1), at about twice the prompt length; it was not measured for Bielik-One-11B-v3.1-r1.
-- **Facts.** `"facts": true` (off in the reference profile) appends computed calendar and number facts to the state (see [Run](#run)). On the public dev split of the Tacit decision benchmark (2,852 items in Polish, English, German and Norwegian; default read twice, one option order, bf16 MLX conversions of the published models) it raised accuracy on the rule-based items by 9.5 percentage points (Bielik-One-4B-r1, 69.9% to 79.4%) and 10.9 (Bielik-One-11B-v3.1-r1, 66.2% to 77.1%), with the other items unchanged (within 0.1 point). Report it when you use it.
-- **Option orders.** `"permutations": N` (up to 16) averages N orders of the options, which reduces position bias; it costs N reads per question.
-- **Repeatability.** Batching under concurrent load changes floating-point order, so a few decisions near the boundary can differ between identical requests (98-100% agreement in our A100 measurements). For repeatable runs keep the `--max-num-seqs` profile fixed and report it. `--fp8` changes 2-18% of decisions depending on model and type; benchmark in bfloat16 unless FP8 is what you deploy.
-- **Long inputs.** Nothing is truncated: a prompt over the 32,768-token context is refused with 422. Count it as an error instead of dropping the question, so every system is scored on the same denominator.
-- **Request layout.** Questions about the same state can go in one request; the state is then read once. This changes speed, not answers.
-- **External harnesses.** `choice`, `noul` and `score` follow the TypeSafe System One schema, so a harness that calls `/v1/systemone` (for example a public Typed Decisions scorer) works against this API unchanged; `labels` and the options above are extensions.
-
-## Contents
-
-`bielik_one/launch.py` (launcher), `bielik_one/mlx_backend.py` and `mlx_model.py` (Apple-silicon backend), `bielik_one/api/` (typed API frontend over a vLLM backend), `bielik_one/prompting/` (prompt rendering), `vllm-heads-plugin/` (`systemone-vllm-heads`, decision heads inside vLLM).
-
-## Tests
-
-```bash
-pip install -e ".[test]" && pytest -q
-```
-
-The tests use synthetic backends and need no GPU. The MLX tests of the LoRA and head math run only where `mlx` is installed (`pip install -e ".[test,mlx]"` on Apple silicon) and are skipped elsewhere.
-
-## Contributing
-
-Issues and pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to report bugs, run the tests and check changes that can affect model outputs; report security issues privately through the repository's Security tab.
-
-## Contributors
-
-- [Krzysztof Wróbel](https://github.com/djstrong) — Bielik One decision models, inference engine, calibration, serving tools and tests.
-- [Filip Reka](https://github.com/FIlipHand) — original vLLM middleware integration, serving chat and typed decisions through one API server.
-
-- [Grzegorz Brzezinka](https://github.com/agentGreg) — Apple-silicon (MLX) backend for adapter packages ([#5](https://github.com/speakleash/bielik-one/pull/5)) and opt-in deterministic calendar and number facts ([#6](https://github.com/speakleash/bielik-one/pull/6)).
-
-Thank you to everyone who contributes code, reports issues and helps improve Bielik One.
-
-## License
-
-Apache License 2.0, see `LICENSE`. Model weights are distributed separately under their own licenses.
-
-### Native answer-token decisions
-
-The explicit `--native-tokens` profile serves original Bielik 3.2 weights using
-existing answer tokens. It loads no LoRA, extra decision heads, vocabulary
-extension or heads plugin. Existing adapter and merged-package commands retain
-their behavior. Use vLLM 0.32.0 in the same environment as the launcher:
+**Original Bielik 3.2:** use its existing answer tokens, with no adapter or extra
+heads. Add `--native-tokens` to both commands:
 
 ```bash
 bielik-one backend /path/to/bielik-3.2 --native-tokens
 bielik-one frontend /path/to/bielik-3.2 --native-tokens
 ```
 
-The backend serves `base` on loopback port 8025; the frontend exposes typed
-`/v1/systemone` requests as `decision` on port 8026 and proxies ordinary chat as
-`base`. One copy of GPU weights serves both routes. Native checkpoints need not
-contain decision-package checksum manifests; `--dry-run` reports
-`checksums_verified: false`. Pin the checkpoint revision for reproducibility.
-Keep the raw backend on loopback unless your network is trusted.
+This serves decisions as `decision` and ordinary chat as `base`, on port **8026**.
+In this mode, `labels` is always a series of independent `noul` questions. See
+[Native Bielik 3.2](docs/native.md) for FP8, calibration and chat parser setup.
 
-Choice uses the existing training-label order: `A..Z`, `a..z`, followed by the
-uppercase pairs supported as single tokens by the tokenizer. The code uses at
-most 255 symbols. Reads exceeding 128 requested token IDs reuse the identical
-complete prompt in multiple requests; raw vocabulary logprobs are merged and
-normalized together. Usage counts every physical chunk prompt. Noul reads `no`
-and `yes`; score reads the digits of ordered levels. Labels always expand to
-independent noul questions, retaining the labels response format and a 0.5
-threshold. Label probabilities need not sum to one and the selected set may be
-empty. These probabilities are uncalibrated unless the model provides calibration.json.
+For **one server and one port**, the [vLLM middleware](docs/serving.md#single-server-middleware-adapter-packages)
+supports adapter packages; [native middleware](docs/native.md#single-server-middleware)
+supports original Bielik 3.2. Both expose `/v1/systemone` directly in vLLM,
+without a separate frontend.
 
-Native decisions use the supplied instructions in ChatML without a general-chat
-preamble. The default assistant suffix is `<think></think>`; frontend option
-`--decision-prefix plain` omits it. This reads answer probabilities, not generated
-reasoning or JSON. Ordinary chat retains the model's original template.
+## Defaults that affect results
 
-Request fields `read_twice` and `read_twice_max_input_tokens` control repetition.
-Set `read_twice: true` with `read_twice_max_input_tokens: null` to repeat every
-input that fits the context. The threshold is decided once per question across
-candidate/permutation reads. Context overflow returns 422 without truncation.
-Answers report the effective prompt variant, reason and read counts;
-`prompt_details: true` includes read lengths and backend chunk counts.
+- **BF16** is the default precision. `--fp8` is optional and can change probabilities
+  and decisions. See [GPU memory and performance](docs/serving.md#gpu-memory-and-performance).
+- **Read twice is on**, with a **4096-token threshold** before repetition. Set
+  `"read_twice": false` for the standard prompt; set
+  `"read_twice_max_input_tokens": null` for unrestricted repetition within context.
+- **Calibration loads automatically** when the model provides `calibration.json`.
+  Send `"temperature": 1` for raw probabilities, or start with `--no-calibration`.
+- **Labels use a dedicated head** in the decision packages by default. Their
+  `"mode": "per_option"` alternative asks one yes/no question per option.
+  Native Bielik 3.2 always uses the latter protocol.
 
-The shared read pool and queue are bounded across HTTP requests, including
-labels expansions. Defaults are 8 read workers, 64 queued reads, 32 active
-processing requests, a 180-second backend timeout and a 300-second processing
-deadline. Configure them on the native frontend with `--max-num-seqs`,
-`--read-queue-size`, `--max-requests`, `--backend-timeout` and `--request-timeout`.
-Admission overload returns 503 with `Retry-After: 1`; timeouts return 504.
-Disconnect cancellation stops queued/future reads; already running synchronous
-calls retain their slots until completion or timeout. Existing body limits and
-error formats apply. Native request-limit flags are rejected for other profiles.
+To reproduce model-card numbers, match the [benchmark settings](docs/benchmarking.md#benchmarking)
+rather than relying on serving defaults. `confidence` describes the output
+distribution; it is not a calibrated probability of correctness.
 
-BF16 is the default. `--fp8` enables on-load FP8 with an unquantized lm_head.
-Prequantized FP8 checkpoints are detected by vLLM without this flag. Prefix
-caching is enabled; the default context is 32768. `--kv-cache-gb` and `--eager`
-remain available. FP8 can change probabilities and decisions, including under
-batching/cache changes. Transformers and vLLM BF16 can also differ numerically;
-backend agreement is not a benchmark accuracy result.
+## Documentation
 
-#### Native decisions in a single vLLM server
+- [API reference](docs/api.md) — requests, answers, confidence, labels modes, facts and errors.
+- [Serving](docs/serving.md) — adapters, merged weights, GPU settings, middleware, MLX and deployment.
+- [Native Bielik 3.2](docs/native.md) — original answer tokens, calibration, FP8 and chat parsers.
+- [Calibration and benchmarking](docs/benchmarking.md) — probability metrics, inference profiles and comparison caveats.
 
-The native middleware adds `/v1/systemone` directly to vLLM, sharing one port and
-one copy of the original weights with chat. No separate frontend, LoRA or heads
-plugin is required:
+## Development
 
 ```bash
-export SYSTEMONE_MODE=native
-export SYSTEMONE_PACKAGE=/path/to/bielik-3.2
-export VLLM_PLUGINS=""
-export VLLM_USE_V2_MODEL_RUNNER=0
-vllm serve "$SYSTEMONE_PACKAGE" --served-model-name bielik-base \
-  --dtype bfloat16 --max-model-len 32768 --max-num-seqs 8 \
-  --max-num-batched-tokens 2048 --max-logprobs 128 --logprobs-mode raw_logprobs \
-  --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware
+pip install -e ".[test]"
+pytest -q
 ```
 
-Use `model: "bielik-base"` for decisions and ordinary chat. The model/tokenizer
-paths must match `SYSTEMONE_PACKAGE`. Startup validates vLLM's resolved model,
-context length, dtype and logprob mode, refusing LoRA and unsupported
-quantization. Supported modes include BF16, on-load FP8 and prequantized
-`compressed-tensors` with FP8 weights and optional FP8 activations. Set
-`SYSTEMONE_DECISION_PREFIX=plain` to omit the default empty-think suffix.
+Tests use synthetic backends and need no GPU. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for contributions and private security reporting.
 
-`GET /v1/systemone/health` checks backend/model readiness. vLLM authentication,
-CORS, shared internal-token/TLS settings and restricted management/prompt-logprob
-routes work as for the existing adapter middleware. When exposing the service,
-set `--api-key` and restrict non-`/v1` routes (including `/invocations`) with a
-reverse proxy or network policy: vLLM API-key authentication does not protect
-every route. Client connections to an exposed service must use HTTPS: configure
-both `--ssl-keyfile` and `--ssl-certfile`, or terminate TLS at that reverse
-proxy. The default middleware mode remains `adapter`.
+## Contributors
 
-Native processing bounds use `SYSTEMONE_WORKERS` (8),
-`SYSTEMONE_READ_QUEUE_SIZE` (64), `SYSTEMONE_MAX_REQUESTS` (32),
-`SYSTEMONE_BACKEND_TIMEOUT` (180 seconds) and `SYSTEMONE_REQUEST_TIMEOUT`
-(300 seconds). These reuse the frontend's bounded pool, overload errors,
-deadlines and cooperative cancellation. The actual vLLM context limit is
-reflected in prompt metadata and context errors.
+- [Krzysztof Wróbel](https://github.com/djstrong) — Bielik One decision models, inference engine, calibration, serving tools and tests.
+- [Filip Reka](https://github.com/FIlipHand) — original vLLM middleware integration, serving chat and typed decisions through one API server.
+- [Grzegorz Brzezinka](https://github.com/agentGreg) — Apple-silicon (MLX) backend for adapter packages ([#5](https://github.com/speakleash/bielik-one/pull/5)) and opt-in deterministic calendar and number facts ([#6](https://github.com/speakleash/bielik-one/pull/6)).
 
-#### Native calibration
+Thank you to everyone who contributes code, reports issues and helps improve Bielik One.
 
-Store model-specific `calibration.json` beside the original checkpoint's
-`config.json`. The native frontend and native middleware load it automatically.
-The library contains no hard-coded model temperatures. Without the file,
-probabilities remain uncalibrated. Invalid or explicitly incomplete calibration
-files fail startup instead of silently falling back.
+## License
 
-A single table applies to **all inference variants**: standard and read twice,
-read-twice thresholds, both decision prefixes, questions before state, option
-permutations, and BF16 or opt-in FP8. Fitting configuration records provenance,
-not inference restrictions. This policy does not establish equal calibration
-quality for every variant. Explicit request `temperature` overrides saved values.
-Labels expanded to noul use their own `labels` temperature; ordinary noul uses
-`binary`. Existing adapter and merged-package calibration behavior is unchanged.
-
-For an explicit frontend file:
-
-```bash
-bielik-one frontend /path/to/bielik-3.2 --native-tokens \
-  --native-calibration /path/to/calibration.json
-```
-
-Use `--no-calibration` to disable loading. With native middleware, set
-`SYSTEMONE_NATIVE_CALIBRATION=/path/to/calibration.json` for an explicit file,
-or `SYSTEMONE_NO_CALIBRATION=1` to disable loading. Explicit files combined with
-disabled calibration are rejected. Health reports `calibrated` and `calibration`;
-these describe loaded defaults even if a request overrides the temperature.
-
-The JSON `temperatures` object must contain four positive finite numbers:
-`choice`, `binary`, `score`, and `labels`. Optional `configuration` records fitting
-provenance. `complete_validation_collection: false` marks a provisional file and
-prevents loading it. Calibration values belong with model weights, not in the
-library. Temperature scaling runs in the API on CPU without changing weights or
-requiring another model pass.
-
-#### Tools and reasoning in native Bielik 3.2 chat
-
-Native serving can load the same upstream `bielik-tools` parsers as adapter
-serving, without modifying the original chat template or decision prompts:
-
-```bash
-bielik-one backend /path/to/bielik-3.2 --native-tokens \
-  --bielik-tools-dir /path/to/bielik-tools
-```
-
-`BIELIK_TOOLS_DIR` provides the default directory; the explicit flag wins.
-`--no-bielik-chat-parsers` disables this setting. Without a directory, parsers
-remain disabled. The checkout must contain the tool/reasoning parsers compatible
-with vLLM 0.32.0. No parser files are copied or downloaded by the launcher.
-
-For direct `vllm serve` with the native middleware, add:
-
-```bash
---enable-auto-tool-choice \
---tool-parser-plugin /path/to/bielik-tools/tools/bielik_vllm_tool_parser.py \
---tool-call-parser bielik \
---reasoning-parser-plugin /path/to/bielik-tools/tools/bielik_vllm_reasoning_parser.py \
---reasoning-parser bielik \
---exclude-tools-when-tool-choice-none
-```
-
-These settings apply to ordinary chat: tool calls are returned in `tool_calls`
-and thinking output is separated into the reasoning field. For Bielik 3.2,
-`reasoning_effort: "none"` disables thinking; a supported non-none effort enables
-it. Keep token budgets large enough to complete thinking and the final answer.
-The typed decision endpoint continues reading the configured answer tokens.
+[Apache License 2.0](LICENSE). Model weights are distributed separately under
+their own licenses.
