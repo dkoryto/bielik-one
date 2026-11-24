@@ -296,3 +296,39 @@ caching is enabled; the default context is 32768. `--kv-cache-gb` and `--eager`
 remain available. FP8 can change probabilities and decisions, including under
 batching/cache changes. Transformers and vLLM BF16 can also differ numerically;
 backend agreement is not a benchmark accuracy result.
+
+#### Native decisions in a single vLLM server
+
+The native middleware adds `/v1/systemone` directly to vLLM, sharing one port and
+one copy of the original weights with chat. No separate frontend, LoRA or heads
+plugin is required:
+
+```bash
+export SYSTEMONE_MODE=native
+export SYSTEMONE_PACKAGE=/path/to/bielik-3.2
+export VLLM_PLUGINS=""
+export VLLM_USE_V2_MODEL_RUNNER=0
+vllm serve "$SYSTEMONE_PACKAGE" --served-model-name bielik-base \
+  --dtype bfloat16 --max-model-len 32768 --max-num-seqs 8 \
+  --max-num-batched-tokens 2048 --max-logprobs 128 --logprobs-mode raw_logprobs \
+  --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware
+```
+
+Use `model: "bielik-base"` for decisions and ordinary chat. The model/tokenizer
+paths must match `SYSTEMONE_PACKAGE`. Startup validates vLLM's resolved model,
+context length, dtype and logprob mode, refusing LoRA and unsupported
+quantization. Supported modes include BF16, on-load FP8 and prequantized
+`compressed-tensors` with FP8 weights and optional FP8 activations. Set
+`SYSTEMONE_DECISION_PREFIX=plain` to omit the default empty-think suffix.
+
+`GET /v1/systemone/health` checks backend/model readiness. vLLM authentication,
+CORS, shared internal-token/TLS settings and restricted management/prompt-logprob
+routes work as for the existing adapter middleware. Set `--api-key` when exposing
+the service. The default middleware mode remains `adapter`.
+
+Native processing bounds use `SYSTEMONE_WORKERS` (8),
+`SYSTEMONE_READ_QUEUE_SIZE` (64), `SYSTEMONE_MAX_REQUESTS` (32),
+`SYSTEMONE_BACKEND_TIMEOUT` (180 seconds) and `SYSTEMONE_REQUEST_TIMEOUT`
+(300 seconds). These reuse the frontend's bounded pool, overload errors,
+deadlines and cooperative cancellation. The actual vLLM context limit is
+reflected in prompt metadata and context errors.
