@@ -272,6 +272,7 @@ class RemoteVllmEngine(LetterEngine):
                 )
             ids = self.prompt_ids(
                 row, questions=questions,
+                first_row=first_rows[index] if first_rows else row,
                 questions_before_state=questions_before_state, read_twice=False,
                 analysis=(analyses or {}).get(row.id, ""),
             )
