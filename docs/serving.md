@@ -50,19 +50,50 @@ For throughput, send all questions about one state in one request: the state is 
 
 ## Tools and reasoning for Bielik adapter chat
 
-To enable the ordinary chat model's tool-call and reasoning parsers on vLLM 0.32.0, point the backend at a local [bielik-tools](https://github.com/speakleash/bielik-tools) checkout compatible with that vLLM version:
+Tool-call and reasoning parsers are **required** for vLLM adapter serving.
+For Bielik 3.0, 3.1 and Minitron adapters (and original Bielik 3.2), obtain one
+trusted upstream [bielik-tools](https://github.com/speakleash/bielik-tools) checkout
+compatible with vLLM 0.32.0:
 
 ```bash
-bielik-one backend speakleash/Bielik-One-11B-v3.1-r1-Adapter \
-  --bielik-tools-dir /opt/bielik-tools --dry-run
-# Remove --dry-run to start the backend; start bielik-one frontend as usual.
+git clone https://github.com/speakleash/bielik-tools.git
+export BIELIK_TOOLS_DIR="$PWD/bielik-tools"
 ```
 
-This enables `--enable-auto-tool-choice`, both `bielik` parsers via `--tool-parser-plugin` / `--reasoning-parser-plugin`, and `--exclude-tools-when-tool-choice-none`. The directory is the repository root containing `tools/`, not `tools/` itself. The launcher checks that the required files exist and passes absolute paths, so it also works from another working directory or a pip installation. Parser code runs inside vLLM: use a trusted checkout pinned to a revision you have tested. No parser files are copied, downloaded or updated by bielik-one.
+Pin that checkout to a revision you have tested. The variable points to the
+repository root containing `tools/`, not to `tools/` itself. Keep this variable
+available in the backend's environment:
 
-Supported adapter bases are `speakleash/Bielik-11B-v3.1-Instruct`, `speakleash/Bielik-11B-v3.0-Instruct` and `speakleash/Bielik-Minitron-7B-v3.0-Instruct`. Bielik 3.1 keeps the base checkpoint's chat template; request thinking with `chat_template_kwargs={"reasoning_effort": "medium"}` (or `none`, `low`, `high`, `max`). The two 3.0 bases use upstream `tools/bielik_advanced_chat_template.jinja` for chat; request thinking with `chat_template_kwargs={"enable_thinking": true}` and `skip_special_tokens: false`. The package's pinned **decision** template and token rendering stay separate. Parser setup does not establish model quality or GPU parity.
+```bash
+bielik-one backend speakleash/Bielik-One-11B-v3.1-r1-Adapter --dry-run
+```
 
-Alternatively set `BIELIK_TOOLS_DIR=/opt/bielik-tools`. An explicit `--bielik-tools-dir` overrides it; `--no-bielik-chat-parsers` disables it for one backend invocation. With neither configured, the command stays unchanged. The environment variable is only used by the vLLM backend, so the frontend and MLX ignore it; explicit parser options on those commands are rejected. Configuring the directory for an unsupported base, Qwen or a merged package is rejected. For custom parser/template flags, use `--no-bielik-chat-parsers --shell` and edit the printed vLLM command to avoid duplicate flags. Both `--shell` and `--dry-run` include the configured parser flags; the same printed command can be used with the single-server middleware below.
+Alternatively pass `--bielik-tools-dir /path/to/bielik-tools`; it overrides the
+environment. The launcher always includes `--enable-auto-tool-choice`, both
+`bielik` parsers via `--tool-parser-plugin` / `--reasoning-parser-plugin`, and
+`--exclude-tools-when-tool-choice-none`. Missing checkout files fail before
+starting vLLM. `--no-bielik-chat-parsers` is rejected. No parser files are copied,
+downloaded or maintained in this repository; parser code runs from that external
+checkout inside vLLM.
+
+Supported adapter bases are `speakleash/Bielik-11B-v3.1-Instruct`,
+`speakleash/Bielik-11B-v3.0-Instruct` and
+`speakleash/Bielik-Minitron-7B-v3.0-Instruct`. Bielik 3.1 keeps its original chat
+template; use `chat_template_kwargs={"reasoning_effort": "medium"}` (or `none`,
+`low`, `high`, `max`). The 3.0 bases use upstream
+`tools/bielik_advanced_chat_template.jinja` for chat; use
+`chat_template_kwargs={"enable_thinking": true}` and `skip_special_tokens: false`.
+Decision prompts still use the package's pinned template.
+
+Qwen adapters automatically use the built-in `qwen3_coder` tool parser and
+`qwen3` reasoning parser, following the [vLLM Qwen3.5 recipe](https://github.com/vllm-project/recipes/blob/main/Qwen/Qwen3.5.md).
+They do not use the Bielik checkout. The environment variable is ignored for
+Qwen, merged packages, the frontend and MLX; an explicit `--bielik-tools-dir` on
+an unsupported model or non-vLLM-backend command is rejected.
+
+Both `--shell` and `--dry-run` include all required parser flags. Keep them when
+running vLLM yourself or using middleware. Middleware refuses startup without the
+required tool/reasoning parser configuration.
 
 ## Running vLLM yourself
 
@@ -95,7 +126,8 @@ The frontend checks every read: a backend started without the required logprob s
 
 The middleware contributed by [Filip Reka](https://github.com/FIlipHand) adds `/v1/systemone` to the same vLLM server as chat, without a separate frontend process. It supports `*-Adapter` packages and uses the existing decision engine, calibration and package checks, including weight checksums.
 
-Use a downloaded adapter package and print the validated backend command:
+Configure the [required chat parsers](#tools-and-reasoning-for-bielik-adapter-chat),
+then use a downloaded adapter package and print the validated backend command:
 
 ```bash
 export SYSTEMONE_PACKAGE=/path/to/adapter-package

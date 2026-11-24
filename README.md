@@ -92,10 +92,13 @@ plugin is needed.
 **LoRA adapter:** use the corresponding `-Adapter` repo and install the
 [decision-heads plugin](docs/serving.md#adapter-and-merged-packages). One copy of
 the original base weights serves both chat and decisions; the adapter is selected
-only for decisions.
+only for decisions. Bielik adapters also require the upstream
+[chat parser setup](docs/serving.md#tools-and-reasoning-for-bielik-adapter-chat);
+Qwen adapters use vLLM's built-in parsers.
 
 **Original Bielik 3.2:** use its existing answer tokens, with no adapter or extra
-heads. Add `--native-tokens` to both commands:
+heads. First configure the required [Bielik chat parsers](docs/serving.md#tools-and-reasoning-for-bielik-adapter-chat),
+then add `--native-tokens` to both commands:
 
 ```bash
 bielik-one backend /path/to/bielik-3.2 --native-tokens
