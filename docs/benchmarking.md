@@ -43,7 +43,14 @@ Earlier unrestricted read-twice measurements raised single-choice accuracy on th
 `"facts": true` (off in the reference profile) appends computed calendar and number facts to the state (see [Computed facts](api.md#computed-facts)). On the public dev split of the Tacit decision benchmark (2,852 items in Polish, English, German and Norwegian; default read twice, one option order, bf16 MLX conversions of the published models) it raised accuracy on the rule-based items by 9.5 percentage points (Bielik-One-4B-r1, 69.9% to 79.4%) and 10.9 (Bielik-One-11B-v3.1-r1, 66.2% to 77.1%), with the other items unchanged (within 0.1 point). Report it when you use it.
 ### Option orders
 
-`"permutations": N` (up to 16) averages N orders of the options, which reduces position bias; it costs N reads per question.
+`"permutations": N` (up to 16) averages option orders to reduce position bias.
+For a standard question, the logical cost is up to N reads, capped by the number
+of distinct option orders. For `labels` in `per_option` mode with K options, the
+cost is **K × min(N, 2)** reads per question: each option becomes a binary question
+with at most two orders. This also applies to native Bielik 3.2 labels.
+
+These are logical decision reads. Large native choice questions can require
+additional HTTP chunk reads; see [native token reads](native.md).
 ### Repeatability
 
 Batching under concurrent load changes floating-point order, so a few decisions near the boundary can differ between identical requests (98-100% agreement in our A100 measurements). For repeatable runs keep the `--max-num-seqs` profile fixed and report it. `--fp8` changes 2-18% of decisions depending on model and type; benchmark in bfloat16 unless FP8 is what you deploy.

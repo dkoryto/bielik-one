@@ -5,7 +5,8 @@
 The explicit `--native-tokens` profile serves original Bielik 3.2 weights using
 existing answer tokens. It loads no LoRA, extra decision heads, vocabulary
 extension or heads plugin. For installation, see the [quick start](../README.md#quick-start). Use vLLM
-0.32.0 in the same environment as the launcher:
+0.32.0 in the same environment as the launcher. Both commands run in the
+foreground: start the backend and frontend in **separate terminals**.
 
 ```bash
 bielik-one backend /path/to/bielik-3.2 --native-tokens

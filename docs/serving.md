@@ -124,9 +124,18 @@ The base model is the repository and revision the package pins (`heads.json`, `s
 
 Pinned versions: `mlx==0.32.4`, `mlx-lm==0.32.2`, bfloat16 weights. On 600 public validation-style questions (Tacit dev, 4 languages, `choice`/`noul`/`score`, raw probabilities), Bielik-One-4B-r1 on this backend agreed with the merged package converted to MLX on 99.3% of decisions (accuracy 91.7% vs 91.3%), using 8.2 GiB of weights for chat and decisions together instead of two models. With the same prompts on both sides, decisions agreed with the vLLM adapter backend on 99.5% (4B), 99.3% (11B-v3.0) and 99.5% (11B-v3.1). Greedy chat is token-identical to plain `mlx_lm` generation with the base model.
 
-For MLX-specific LoRA and head math tests, install `pip install -e ".[test,mlx]"`
-on Apple silicon and run `pytest -q`. These tests are skipped when MLX is not
-installed.
+For MLX-specific LoRA and head math tests, work from a source checkout on
+Apple silicon. A Git URL installation alone does not leave the test suite in
+your current directory:
+
+```bash
+git clone https://github.com/speakleash/bielik-one.git
+cd bielik-one
+pip install -e ".[test,mlx]"
+pytest -q
+```
+
+These tests are skipped when MLX is not installed.
 
 ## Deployment and untrusted text
 

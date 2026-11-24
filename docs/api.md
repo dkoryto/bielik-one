@@ -14,6 +14,12 @@ sent together to reuse the prefix cache. OpenAPI documentation is available at
 
 ## Request example
 
+This example targets the **separate frontend** on port 8026, using the
+`decision` model alias. With [adapter middleware](serving.md#single-server-middleware-adapter-packages)
+or [native middleware](native.md#single-server-middleware), use the middleware
+server's address/port and public served-model name (for example `bielik-base`)
+instead; `decision` is not its public model alias.
+
 ```bash
 curl -s localhost:8026/v1/systemone -H 'Content-Type: application/json' -d '{
   "model": "decision",
