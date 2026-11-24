@@ -40,7 +40,7 @@ Do not build your own scheme. Use one your organisation already runs:
 
 - **HTTP Basic over TLS** (as in the reference files): create the file with the first user, `htpasswd -cB /etc/nginx/bielik-one.htpasswd alice`, and add later users without `-c` (`htpasswd -B /etc/nginx/bielik-one.htpasswd bob`), because `-c` overwrites an existing file. If `htpasswd` is not installed, append one `user:hash` line per user: `printf 'alice:%s\n' "$(openssl passwd -apr1)" | sudo tee -a /etc/nginx/bielik-one.htpasswd`. Suitable for a few service accounts.
 - **Single sign-on (OIDC):** put an authenticating proxy such as oauth2-proxy next to nginx and replace `auth_basic` with `auth_request /oauth2/auth;` following that proxy's nginx guide.
-- **Client certificates (mTLS):** for machine clients, replace `auth_basic` with `ssl_client_certificate /etc/nginx/tls/clients-ca.pem; ssl_verify_client on;`.
+- **Client certificates (mTLS):** for machine clients, replace `auth_basic` with `ssl_client_certificate /etc/nginx/tls/clients-ca.pem; ssl_verify_client optional;` at server level, and add `if ($ssl_client_verify != SUCCESS) { return 403; }` to every location except the probe. Do not use `ssl_verify_client on`: nginx then asks for the certificate during the TLS handshake, before it picks a location, so a load balancer without a certificate could not reach the probe either.
 
 With the middleware, vLLM's own `--api-key` covers only paths under `/v1`. The proxy authenticates every path. If you also keep the vLLM key, set it upstream with `proxy_set_header Authorization "Bearer <key>";` so clients never see it.
 
@@ -59,13 +59,18 @@ From a machine outside the allowed probe networks, with `$H` the proxy's host na
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' https://$H/v1/systemone -X POST -d '{}'            # 401
-curl -s -o /dev/null -w '%{http_code}\n' https://$H/health                                  # 403
+curl -s -o /dev/null -w '%{http_code}\n' https://$H/health                                  # 403 (frontend)
+curl -s -o /dev/null -w '%{http_code}\n' https://$H/v1/systemone/health                     # 403 (middleware)
 curl -s -o /dev/null -w '%{http_code}\n' -u alice https://$H/docs                           # 404
 curl -s -u alice https://$H/v1/systemone -H 'Content-Type: application/json' -d '{
   "model": "decision", "state": "The invoice is overdue.",
   "questions": {"late": {"type": "noul", "instructions": "Is the payment late?"}}}'         # an answer (frontend)
-curl -s -o /dev/null -w '%{http_code}\n' http://$H:8026/health                             # connection refused
+curl -s -o /dev/null -w '%{http_code}\n' http://$H:8026/health                             # connection refused (frontend)
+curl -s -o /dev/null -w '%{http_code}\n' http://$H:8025/health                             # connection refused (vLLM backend)
+curl -s -o /dev/null -w '%{http_code}\n' http://$H:8000/health                             # connection refused (vllm serve with the middleware)
 ```
+
+A `curl` that prints `000` means the connection failed, which is the expected result for the last three. Any HTTP status there means the port is reachable from outside. With other `--port` / `--backend-host` values, check those ports instead; for the 4B packages the defaults are 8012 (frontend) and 8013 (backend).
 
 With the middleware, `decision` is the internal adapter name and is refused (422). Use the base model's public name instead, one of those listed by `curl -s -u alice https://$H/v1/models` (for example `bielik-base`):
 
