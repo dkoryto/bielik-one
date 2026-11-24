@@ -9,6 +9,8 @@ a calibration temperature, if the caller sends one, is applied to that mean.
 
 from __future__ import annotations
 
+from fastapi import Request
+
 import json
 import math
 import random
@@ -831,7 +833,8 @@ def answer_confidence(answer: Mapping) -> float:
     return float(answer["confidence"])
 
 
-def build_app(engine: "LetterEngine", error_format: str = "default"):
+def build_app(engine: "LetterEngine", error_format: str = "default", *,
+              max_requests: int | None = None, request_timeout: float = 300):
     """Typed decision endpoint for a ready engine. The vLLM frontend adds health, models and chat routes."""
     from fastapi import FastAPI, HTTPException
 
@@ -840,7 +843,6 @@ def build_app(engine: "LetterEngine", error_format: str = "default"):
     app = FastAPI(title="Bielik One decisions")
     install(app, error_format)
 
-    @app.post("/v1/systemone")
     def systemone(body: SystemOneIn) -> dict[str, Any]:
         try:
             return engine.evaluate(body)
@@ -850,4 +852,15 @@ def build_app(engine: "LetterEngine", error_format: str = "default"):
                 detail=[{"loc": exc.loc, "msg": exc.msg, "type": "value_error"}],
             ) from exc
 
+    endpoint = systemone
+    if max_requests is not None:
+        from fastapi import Request
+        from bielik_one.api.request_execution import RequestExecutor
+        from bielik_one.api.remote_vllm import install_backend_errors
+        install_backend_errors(app,error_format)
+        executor = RequestExecutor(max_requests,request_timeout)
+        async def bounded_systemone(body: SystemOneIn, request: Request):
+            return await executor.run(systemone,body,request)
+        endpoint = bounded_systemone
+    app.add_api_route("/v1/systemone",endpoint,methods=["POST"],response_model=dict[str, Any])
     return app
