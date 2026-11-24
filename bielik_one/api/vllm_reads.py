@@ -4,7 +4,8 @@ from __future__ import annotations
 import contextvars
 import math
 import threading
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
+from collections.abc import Mapping
 
 import httpx
 from bielik_one.api.http_guard import backend_request_id
@@ -32,8 +33,8 @@ def conditional_logprobs(values, wanted):
     if not logits or not all(math.isfinite(v) for v in logits):
         raise ValueError('Invalid answer logits')
     peak = max(logits)
-    log_z = peak + math.log(math.fsum(math.exp(v-peak) for v in logits))
-    return {i:v-log_z for i,v in zip(wanted,logits,strict=True)}
+    log_z = math.log(math.fsum(math.exp(v-peak) for v in logits))
+    return {i:(v-peak)-log_z for i,v in zip(wanted,logits,strict=True)}
 
 
 class VllmReadTransport:
@@ -81,12 +82,13 @@ class VllmReadTransport:
                 response=self.client.post((url or self.url)+'/v1/completions',json=payload,
                     headers={'X-Request-Id':rid} if rid else None)
                 check_cancelled();response.raise_for_status();body=response.json()
-                table={int(k.removeprefix('token_id:')):float(v)
-                    for k,v in body['choices'][0]['logprobs']['top_logprobs'][0].items()}
+                raw_table=body['choices'][0]['logprobs']['top_logprobs'][0]
+                if not isinstance(raw_table,Mapping):raise ValueError('invalid logprob table')
+                table={int(k.removeprefix('token_id:')):float(v) for k,v in raw_table.items()}
                 if body['usage']['prompt_tokens'] != len(prompt):raise ValueError('backend changed prompt length')
                 if any(i not in table or not math.isfinite(table[i]) for i in requested):
                     raise ValueError('missing or non-finite requested logprobs')
-                if canary is not None and (canary not in table or table[canary]>-9990):
+                if canary is not None and (canary not in table or not math.isfinite(table[canary]) or table[canary]>-9990):
                     raise ValueError('backend did not apply decision heads to a flagged base row (logits processor missing?)')
                 if reject_clamped and any(table[i]<=-9990 for i in requested):
                     raise ValueError('invalid or clamped requested logprob')
@@ -116,26 +118,41 @@ class VllmReadTransport:
             raise
 
     def map(self, function, tasks):
-        if self.slots is None:
-            futures=[self._submit(function,task) for task in tasks]
-            return [future.result() for future in futures]
         tasks=iter(enumerate(tasks));pending={};results={}
         try:
-            for _ in range(self.workers):
-                item=next(tasks,None)
-                if item is None:break
-                i,task=item;pending[self._submit(function,task)]=i
+            # Preserve unbounded adapter submission; native uses a rolling window.
+            if self.slots is None:
+                for i,task in tasks:pending[self._submit(function,task)]=i
+            else:
+                for _ in range(self.workers):
+                    item=next(tasks,None)
+                    if item is None:break
+                    i,task=item;pending[self._submit(function,task)]=i
             while pending:
                 check_cancelled()
-                done,_=wait(pending,timeout=.1,return_when=FIRST_COMPLETED)
+                # shutdown(cancel_futures=True) can leave cancelled futures in a
+                # state that concurrent.futures.wait does not report as done.
+                done={future for future in pending if future.done()}
+                if not done:
+                    done,_=wait(pending,timeout=.05,return_when=FIRST_COMPLETED)
                 for future in done:
-                    i=pending.pop(future);results[i]=future.result()
-                    item=next(tasks,None)
-                    if item is not None:
+                    i=pending.pop(future)
+                    try:results[i]=future.result()
+                    except CancelledError as exc:
+                        raise BackendReadError('Decision read was cancelled') from exc
+                if self.slots is not None:
+                    for _ in done:
+                        item=next(tasks,None)
+                        if item is None:break
                         j,task=item;pending[self._submit(function,task)]=j
             return [results[i] for i in range(len(results))]
         finally:
+            # Keep the evaluator (and its HTTP permit) alive until its own
+            # active reads finish, without waiting for unrelated queued work.
             for future in pending:future.cancel()
+            for future in pending:
+                try:future.result()
+                except BaseException:pass
 
     def __call__(self,tasks):
         return self.map(self._read,[(task,) for task in tasks])
