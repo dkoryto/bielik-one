@@ -252,6 +252,10 @@ class RemoteVllmEngine(LetterEngine):
         read also carries the anchor and, on flagged base rows, the canary."""
         return MAX_LOGPROB_TOKEN_IDS - 1 - (1 if on_base else 0)
 
+    def _reads_per_prompt(self, row) -> int:
+        """Backend reads _read() makes for one prompt of this row: the anchor travels separately from the options."""
+        return -(-len(row.options) // self._chunk_width(row.question.type in self.base_row_types))
+
     def _read(self, prompt: list[int], output_ids: list[int], kind: str):
         anchor = int(self.parking["anchor_id"])
         on_base = kind in self.base_row_types
@@ -304,8 +308,7 @@ class RemoteVllmEngine(LetterEngine):
                 raise RequestError(["questions", row.id], CONTEXT_LIMIT)
             # Checked while the prompts are built, so an oversized request stops before it holds them all. Questions
             # with more options than one read can carry count once per read.
-            width = self._chunk_width(row.question.type in self.base_row_types)
-            chunks.append(-(-len(row.options) // width))
+            chunks.append(self._reads_per_prompt(row))
             sent_tokens += len(ids) * chunks[-1]
             if self.max_request_tokens is not None and sent_tokens > self.max_request_tokens:
                 raise RequestError(

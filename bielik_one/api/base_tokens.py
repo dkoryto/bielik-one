@@ -46,6 +46,10 @@ class BaseTokenEngine(RemoteVllmEngine):
         self.labels_capacity=0;self.parking=None;self.labels_threshold=.5;self.semantic=True
         self.temperatures={};self.calibration_source=None;self.reasoners={};self.aliases={model_name}
 
+    def _reads_per_prompt(self,row):
+        # The first answer token is the anchor, so only the other options take room in a read (as read_count counts).
+        return VllmTokenReadout.read_count(list(range(len(row.options))))
+
     def prompt_ids(self,row,**kwargs):
         if kwargs.pop('analysis',''):
             raise ValueError('Reasoning not supported by native base token readout')
