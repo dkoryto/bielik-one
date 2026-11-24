@@ -204,3 +204,16 @@ def test_native_calibration_applies_across_request_variants(tmp_path):
     value['complete_validation_collection']=False;path.write_text(json.dumps(value))
     with pytest.raises(ValueError,match='provisional'):
         engine.load_calibration(path)
+
+
+def test_native_labels_temperature_preserves_scalar_calibration_contract():
+    from bielik_one.api.server import apply_temperature,score_orders
+    engine=BaseTokenEngine(Tok(),lambda tasks:[])
+    from bielik_one.api.vllm_reads import conditional_logprobs
+    tables=[conditional_logprobs({7:0.,8:20.},[7,8])]
+    ids=[7,8];orders=[[0,1]]
+    raw=score_orders(tables,ids,orders,1.)[1]
+    assert raw==1.  # Saved scalar predictions lose the tiny P(no).
+    actual=engine.per_option_probability(tables,ids,orders,10.,1)
+    assert actual==pytest.approx(apply_temperature([1-raw,raw],10.)[1])
+    assert actual!=pytest.approx(score_orders(tables,ids,orders,10.)[1])
