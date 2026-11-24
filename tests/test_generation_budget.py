@@ -322,3 +322,37 @@ def test_frontend_parser_defaults_and_none():
     for args in (["--max-generation-n", "0"], ["--max-generation-tokens", "abc"]):
         with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
             parser.parse_args(args)
+
+
+# -- review fixes ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("extra", [{"n": -1}, {"n": 0}, {"n": -4, "best_of": -8}, {"best_of": -1}])
+def test_negative_or_zero_counts_do_not_lower_the_cost(extra):
+    # /v1/responses ignores n, so vLLM still answers once with the full max_output_tokens.
+    tight = GenerationLimits(max_n=16, max_tokens=4096, context_tokens=32_768)
+    error = refused({"input": "x", "max_output_tokens": 8192, **extra}, RESPONSES, tight)
+    assert "1 answer(s) x 8192 tokens" in error.msg
+
+
+def test_token_in_route_reads_only_sampling_params():
+    tight = GenerationLimits(max_n=16, max_tokens=4096, context_tokens=32_768)
+    route = "/inference/v1/generate"
+    check_generation_budget({"token_ids": [1], "sampling_params": {"max_tokens": 32}}, tight, route)
+    error = refused({"token_ids": [1], "sampling_params": {"n": 2, "max_tokens": 4096}}, route, tight)
+    assert error.loc == ["body", "sampling_params", "max_tokens"]
+    # Without sampling_params the request is still charged as before.
+    refused({"token_ids": [1]}, route, tight)
+
+
+def test_middleware_charges_unset_limits_with_the_served_context():
+    from types import SimpleNamespace
+
+    # The budget allows one 40,000-token answer; vLLM serves a 65,536-token context, so an answer without max_tokens
+    # may be longer than that, and an engine default of 32,768 would let it through.
+    app, _, _, _ = make_app(max_generation_tokens=40_000)
+    app.state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=65_536))
+    with TestClient(app) as client:
+        assert client.post("/v1/chat/completions", json={"model": "base-a", "messages": []}).status_code == 400
+        ok = {"model": "base-a", "messages": [], "max_tokens": 40_000}
+        assert client.post("/v1/chat/completions", json=ok).status_code == 200

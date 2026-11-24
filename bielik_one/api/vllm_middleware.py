@@ -531,6 +531,7 @@ class SystemOneMiddleware:
         self._bind_lock = asyncio.Lock()
         self._bind_failure: tuple[float, int, bytes] | None = None  # (monotonic time, status, error body)
         self._ssl = self.settings.ssl_context()
+        self._generation_context = None  # vLLM's max_model_len, read at startup; the budget charges unset limits with it
         self._verify = self.settings.verify()
         self._internal = self.settings.internal_token.encode()
         self._api_key = self.settings.api_key
@@ -567,6 +568,7 @@ class SystemOneMiddleware:
             try:
                 self._check_server_count(app)
                 async with original_lifespan(app) as state:
+                    self._read_generation_context(app)
                     if self.settings.mode == "native":
                         self._check_native_backend(app)
                     self._check_chat_parsers(app)
@@ -575,6 +577,15 @@ class SystemOneMiddleware:
                 self.engine.close()
 
         router.lifespan_context = lifespan
+
+    def _read_generation_context(self, app):
+        """The context length vLLM serves with: an answer without an explicit limit may run to its end."""
+        config = getattr(getattr(app, "state", None), "vllm_config", None)
+        model = getattr(config, "model_config", None)
+        args = getattr(getattr(app, "state", None), "args", None)
+        length = getattr(model, "max_model_len", None) or getattr(args, "max_model_len", None)
+        if isinstance(length, int) and length > 0:
+            self._generation_context = length
 
     def _check_server_count(self, app):
         args = getattr(getattr(app, "state", None), "args", None)
@@ -835,7 +846,7 @@ class SystemOneMiddleware:
             limits = GenerationLimits(
                 self.settings.max_generation_n,
                 self.settings.max_generation_tokens,
-                getattr(self.engine, "max_model_len", 32768),
+                self._generation_context or getattr(self.engine, "max_model_len", 32768),
             )
             blocked = {self.settings.lora_name} if self.settings.mode == "adapter" else set()
             body = public_request_body(_scrub_sampling_params(raw), blocked, None, limits, scope.get("path"))

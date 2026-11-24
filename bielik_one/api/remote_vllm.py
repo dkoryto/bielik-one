@@ -476,8 +476,13 @@ def check_generation_budget(
     set; for a route not listed, the costliest reading counts. Token-in requests carry these fields in
     sampling_params, which is checked the same way.
     """
-    n = _count(body.get("n")) or 1
-    best_of = _count(body.get("best_of")) or 0
+    if not loc and route and _on(route, "/inference/v1/generate") and isinstance(body.get("sampling_params"), dict):
+        # The token-in route reads n, best_of and max_tokens only from sampling_params.
+        return check_generation_budget(body["sampling_params"], limits, route, ("sampling_params",))
+    # At least one answer: a route that ignores n (such as /v1/responses) still answers once, so a negative or zero
+    # value must not lower the count.
+    n = max(1, _count(body.get("n")) or 1)
+    best_of = max(0, _count(body.get("best_of")) or 0)
     width, width_field = (best_of, "best_of") if best_of > n else (n, "n")
     if limits.max_n is not None and width > limits.max_n:
         raise RequestError([*loc, width_field], f"{width_field} is {width}; this server allows at most {limits.max_n}")
