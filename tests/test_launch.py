@@ -7,7 +7,7 @@ import io, contextlib
 from bielik_one import launch
 
 
-def package(kind, root):
+def package(kind, root, *, base_model="speakleash/Bielik-11B-v3.1-Instruct"):
     files = {
         "conversion.json": {
             "base_revision": "r1",
@@ -17,7 +17,7 @@ def package(kind, root):
     }
     if kind == "llama-adapter":
         files["serving.json"] = {
-            "base_model": "speakleash/Bielik-11B-v3.1-Instruct",
+            "base_model": base_model,
             "base_revision": "r1",
             "base_alias": "bielik-base",
             "rank": 64,
