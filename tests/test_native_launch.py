@@ -71,3 +71,21 @@ def test_native_calibration_forwarding_and_disable(tmp_path):
         dry('frontend',root,'--native-tokens','--native-calibration',str(calibration),'--no-calibration')
     with pytest.raises(ValueError,match='only to frontend'):
         dry('backend',root,'--native-tokens','--native-calibration',str(calibration))
+
+
+def test_native_frontend_cli_reaches_real_application_startup(tmp_path,monkeypatch):
+    import sys,uvicorn
+    from transformers import AutoTokenizer
+    from fastapi.testclient import TestClient
+    from test_base_tokens import Tok
+    from bielik_one.api import base_tokens
+    monkeypatch.setattr(AutoTokenizer,'from_pretrained',lambda *a,**kw:Tok())
+    monkeypatch.setattr(sys,'argv',['base_tokens','--base-model',str(tmp_path),'--backend-url','http://backend'])
+    started=[]
+    def run(app,**kwargs):
+        with TestClient(app) as client:
+            assert client.get('/openapi.json').status_code==200
+        started.append(kwargs)
+    monkeypatch.setattr(uvicorn,'run',run)
+    base_tokens.main()
+    assert started and started[0]['port']==8026
