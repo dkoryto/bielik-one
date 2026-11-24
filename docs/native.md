@@ -8,6 +8,11 @@ extension or heads plugin. For installation, see the [quick start](../README.md#
 0.32.0 in the same environment as the launcher. Both commands run in the
 foreground: start the backend and frontend in **separate terminals**.
 
+Chat tool-call and reasoning parsers are **required**, including for middleware.
+First configure the [external bielik-tools checkout](serving.md#tools-and-reasoning-for-bielik-adapter-chat)
+through `BIELIK_TOOLS_DIR` or backend `--bielik-tools-dir`. Missing parser files
+fail startup; no parser code is copied into this project.
+
 ```bash
 bielik-one backend /path/to/bielik-3.2 --native-tokens
 bielik-one frontend /path/to/bielik-3.2 --native-tokens
@@ -63,9 +68,11 @@ backend agreement is not a benchmark accuracy result.
 
 The native middleware adds `/v1/systemone` directly to vLLM, sharing one port and
 one copy of the original weights with chat. No separate frontend, LoRA or heads
-plugin is required:
+plugin is required. Chat tool-call and reasoning parsers are mandatory; the
+complete command below includes them:
 
 ```bash
+export BIELIK_TOOLS_DIR=/path/to/bielik-tools
 export SYSTEMONE_MODE=native
 export SYSTEMONE_PACKAGE=/path/to/bielik-3.2
 export VLLM_PLUGINS=""
@@ -73,7 +80,13 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 vllm serve "$SYSTEMONE_PACKAGE" --served-model-name bielik-base \
   --dtype bfloat16 --max-model-len 32768 --max-num-seqs 8 \
   --max-num-batched-tokens 2048 --max-logprobs 128 --logprobs-mode raw_logprobs \
-  --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware
+  --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware \
+  --enable-auto-tool-choice \
+  --tool-parser-plugin "$BIELIK_TOOLS_DIR/tools/bielik_vllm_tool_parser.py" \
+  --tool-call-parser bielik \
+  --reasoning-parser-plugin "$BIELIK_TOOLS_DIR/tools/bielik_vllm_reasoning_parser.py" \
+  --reasoning-parser bielik \
+  --exclude-tools-when-tool-choice-none
 ```
 
 Use `model: "bielik-base"` for decisions and ordinary chat. The model/tokenizer
@@ -137,29 +150,11 @@ requiring another model pass.
 
 ## Chat tools and reasoning
 
-Native serving can load the same upstream [`bielik-tools`](https://github.com/speakleash/bielik-tools) parsers as [adapter
-serving](serving.md#tools-and-reasoning-for-bielik-adapter-chat), without modifying the original chat template or decision prompts:
-
-```bash
-bielik-one backend /path/to/bielik-3.2 --native-tokens \
-  --bielik-tools-dir /path/to/bielik-tools
-```
-
-`BIELIK_TOOLS_DIR` provides the default directory; the explicit flag wins.
-`--no-bielik-chat-parsers` disables this setting. Without a directory, parsers
-remain disabled. The checkout must contain the tool/reasoning parsers compatible
-with vLLM 0.32.0. No parser files are copied or downloaded by the launcher.
-
-For direct `vllm serve` with the native middleware, add:
-
-```bash
---enable-auto-tool-choice \
---tool-parser-plugin /path/to/bielik-tools/tools/bielik_vllm_tool_parser.py \
---tool-call-parser bielik \
---reasoning-parser-plugin /path/to/bielik-tools/tools/bielik_vllm_reasoning_parser.py \
---reasoning-parser bielik \
---exclude-tools-when-tool-choice-none
-```
+The launcher and the complete middleware command above both load the required
+upstream `bielik-tools` parsers. The original Bielik 3.2 chat template and decision
+prompts stay unchanged. Use `BIELIK_TOOLS_DIR` to select the external checkout;
+backend `--bielik-tools-dir` overrides it. Both parser files must be compatible
+with vLLM 0.32.0. There is no parser opt-out.
 
 These settings apply to ordinary chat: tool calls are returned in `tool_calls`
 and thinking output is separated into the reasoning field. For Bielik 3.2,

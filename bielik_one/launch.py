@@ -318,8 +318,8 @@ def backend(
     return argv, {"VLLM_PLUGINS": "", "VLLM_MAX_NUM_BAD_WORDS": "2048"}
 
 
-# Chat parsers are maintained upstream, not copied into bielik-one. Keep this
-# allowlist separate from the decision tokenizer/template pinned by the package.
+# Chat parsers live in the upstream bielik-tools checkout, independently of
+# the decision tokenizer/template pinned by the package.
 BIELIK_CHAT_MODELS = {
     "speakleash/Bielik-11B-v3.1-Instruct": False,
     "speakleash/Bielik-11B-v3.0-Instruct": True,
@@ -327,8 +327,8 @@ BIELIK_CHAT_MODELS = {
 }
 
 
-def bielik_chat_args(root: Path, kind: str, tools_dir: str) -> list[str]:
-    """Opt-in chat setup from a local bielik-tools checkout (vLLM 0.32)."""
+def bielik_chat_args(root: Path, kind: str, tools_dir: str | None = None) -> list[str]:
+    """Required chat setup from one external bielik-tools checkout."""
     if kind == "native-tokens":
         # Original Bielik 3.2 already supplies its chat template.
         advanced_template = False
@@ -339,6 +339,8 @@ def bielik_chat_args(root: Path, kind: str, tools_dir: str) -> list[str]:
         if model not in BIELIK_CHAT_MODELS:
             raise ValueError(f"--bielik-tools-dir: unsupported base model {model!r}")
         advanced_template = BIELIK_CHAT_MODELS[model]
+    if not tools_dir:
+        raise ValueError("Bielik tool and reasoning parsers are required: set BIELIK_TOOLS_DIR or --bielik-tools-dir to a trusted bielik-tools checkout")
     tools = Path(tools_dir).expanduser().resolve() / "tools"
     tool_parser = tools / "bielik_vllm_tool_parser.py"
     reasoning_parser = tools / "bielik_vllm_reasoning_parser.py"
@@ -364,8 +366,20 @@ def bielik_chat_args(root: Path, kind: str, tools_dir: str) -> list[str]:
 
 def chat_tools_dir(args):
     if args.no_bielik_chat_parsers:
-        return None
+        raise ValueError("Chat tool and reasoning parsers are required; --no-bielik-chat-parsers is no longer supported")
     return args.bielik_tools_dir if args.bielik_tools_dir is not None else os.environ.get("BIELIK_TOOLS_DIR")
+
+
+def required_chat_args(root: Path, kind: str, args) -> list[str]:
+    tools_dir = chat_tools_dir(args)
+    if kind in ("llama-adapter", "native-tokens"):
+        return bielik_chat_args(root, kind, tools_dir)
+    if args.bielik_tools_dir is not None:
+        return bielik_chat_args(root, kind, tools_dir)  # Reject explicit Bielik overrides on other model types.
+    if kind == "qwen-adapter":
+        return ["--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",
+                "--reasoning-parser", "qwen3", "--exclude-tools-when-tool-choice-none"]
+    return []
 
 
 def frontend(
@@ -500,9 +514,7 @@ def native_commands(root, component, args):
                    "--logprobs-mode", "raw_logprobs", "--enable-prefix-caching",
                    "--max-num-seqs", str(args.max_num_seqs or 8),
                    "--max-num-batched-tokens", "2048", "--gpu-memory-utilization", "0.90"]
-        tools_dir = chat_tools_dir(args)
-        if tools_dir:
-            command += bielik_chat_args(root, "native-tokens", tools_dir)
+        command += required_chat_args(root, "native-tokens", args)
         if args.fp8:
             command += FP8
         if args.kv_cache_gb is not None:
@@ -552,13 +564,13 @@ def main(argv=None):
     chat.add_argument(
         "--bielik-tools-dir",
         metavar="DIR",
-        help="vLLM backend: enable tools/reasoning for native Bielik 3.2 or Bielik 3.1, 3.0 and Minitron adapters "
-        "using this bielik-tools checkout (default: BIELIK_TOOLS_DIR); no files are downloaded",
+        help="vLLM backend: required bielik-tools checkout for Bielik tool/reasoning parsers "
+        "(default: BIELIK_TOOLS_DIR); no parser files are copied or downloaded",
     )
     chat.add_argument(
         "--no-bielik-chat-parsers",
         action="store_true",
-        help="vLLM backend: ignore BIELIK_TOOLS_DIR and leave chat parsers/template unchanged",
+        help="removed: tool and reasoning parsers are required for adapter/native vLLM serving",
     )
     p.add_argument(
         "--host",
@@ -734,12 +746,10 @@ def main(argv=None):
         argv, extra = backend(
             root, kind, a.backend_host, a.port or back_port, a.fp8, a.eager
         )
-        tools_dir = chat_tools_dir(a)
-        if tools_dir:
-            try:
-                argv += bielik_chat_args(root, kind, tools_dir)
-            except ValueError as exc:
-                p.error(str(exc))
+        try:
+            argv += required_chat_args(root, kind, a)
+        except ValueError as exc:
+            p.error(str(exc))
         argv = override(argv, "--max-num-seqs", a.max_num_seqs)
         argv = override(
             argv,

@@ -327,7 +327,7 @@ class PackageTests(unittest.TestCase):
     def test_adapter_packages_pin_their_base(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            package("llama-adapter", root)
+            package("llama-adapter", root, base_model="org/base")
             info = mlx_backend.adapter_package(root, "llama-adapter")
             self.assertEqual((info["repo"], info["revision"], info["alias"]), ("org/base", "r1", "bielik-base"))
             self.assertEqual(info["adapter"], root / "adapter")

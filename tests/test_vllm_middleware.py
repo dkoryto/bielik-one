@@ -80,7 +80,8 @@ def make_app(*, keys=(), env_key=None, limit=16, cards=None, root_path="", fail_
             startup.append("shutdown")
 
     app = FastAPI(lifespan=lifespan, root_path=root_path)
-    app.state.args = SimpleNamespace(api_key=list(keys), api_server_count=server_count)
+    app.state.args = SimpleNamespace(api_key=list(keys), api_server_count=server_count,
+        enable_auto_tool_choice=True,tool_call_parser="bielik",reasoning_parser="bielik")
     if settings.get('mode')=='native':
         settings.setdefault('package',Path('/original-model'))
         app.state.vllm_config=SimpleNamespace(model_config=SimpleNamespace(
@@ -734,3 +735,53 @@ def test_native_middleware_loads_model_calibration(tmp_path,monkeypatch,disabled
             assert engine.calibration_source==str(custom if explicit else default)
     finally:
         engine.close()
+
+
+@pytest.mark.parametrize('mode',['native','adapter'])
+@pytest.mark.parametrize('missing',['tool_call_parser','reasoning_parser','enable_auto_tool_choice'])
+def test_middleware_requires_chat_parsers_at_startup(mode,missing):
+    app,owner,engine,_=make_app(mode=mode)
+    engine.chat_parser_profile='bielik'
+    setattr(app.state.args,missing,False if missing=='enable_auto_tool_choice' else None)
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_middleware_validates_effective_reasoning_configuration():
+    app,owner,engine,_=make_app(mode='native')
+    app.state.vllm_config.structured_outputs_config=SimpleNamespace(reasoning_parser=None)
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_qwen_middleware_checks_matching_parser_pair():
+    app,owner,engine,_=make_app()
+    engine.chat_parser_profile='qwen'
+    app.state.args.tool_call_parser='qwen3_coder'
+    app.state.args.reasoning_parser='qwen3'
+    with TestClient(app):pass
+    assert engine.closed==1
+
+
+def test_injected_engine_does_not_bypass_required_chat_parsers():
+    app,owner,engine,_=make_app()
+    app.state.args.tool_call_parser=None
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1
+
+
+@pytest.mark.parametrize('profile,wrong_tool,wrong_reasoning',[
+    ('bielik','qwen3_coder','qwen3'),('qwen','bielik','bielik')])
+def test_middleware_rejects_wrong_nonempty_effective_parser_pair(profile,wrong_tool,wrong_reasoning):
+    app,owner,engine,_=make_app()
+    engine.chat_parser_profile=profile
+    app.state.args.tool_call_parser=wrong_tool
+    app.state.args.reasoning_parser=wrong_reasoning
+    app.state.vllm_config=SimpleNamespace(
+        structured_outputs_config=SimpleNamespace(reasoning_parser=wrong_reasoning))
+    with pytest.raises(RuntimeError,match='parsers are required'):
+        with TestClient(app):pass
+    assert engine.closed==1

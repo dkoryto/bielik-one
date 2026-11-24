@@ -3,6 +3,14 @@ import pytest
 from test_launch import dry
 
 
+@pytest.fixture(autouse=True)
+def required_tools(tmp_path,monkeypatch):
+    tools=tmp_path/'external-chat-parsers'/'tools';tools.mkdir(parents=True)
+    for name in ['bielik_vllm_tool_parser.py','bielik_vllm_reasoning_parser.py']:
+        (tools/name).write_text('# external fixture')
+    monkeypatch.setenv('BIELIK_TOOLS_DIR',str(tools.parent))
+
+
 def original(tmp_path):
     (tmp_path/'config.json').write_text(json.dumps({'model_type':'llama','architectures':['LlamaForCausalLM']}))
     return str(tmp_path)
@@ -89,7 +97,7 @@ def test_native_frontend_cli_reaches_real_application_startup(tmp_path,monkeypat
     assert started and started[0]['port']==8026
 
 
-def test_native_chat_parsers_reuse_shipped_template_and_respect_opt_out(tmp_path,monkeypatch):
+def test_native_chat_parsers_reuse_shipped_template_and_reject_opt_out(tmp_path,monkeypatch):
     import shlex
     from bielik_one import launch
     root=original(tmp_path)
@@ -103,7 +111,8 @@ def test_native_chat_parsers_reuse_shipped_template_and_respect_opt_out(tmp_path
     assert cmd[cmd.index('--tool-call-parser')+1]=='bielik'
     assert cmd[cmd.index('--reasoning-parser')+1]=='bielik'
     assert '--enable-auto-tool-choice' in cmd and '--chat-template' not in cmd
-    assert '--tool-call-parser' not in dry('backend',root,'--native-tokens','--no-bielik-chat-parsers')['command']
+    with pytest.raises(ValueError,match='parsers are required'):
+        dry('backend',root,'--native-tokens','--no-bielik-chat-parsers')
     monkeypatch.setenv('BIELIK_TOOLS_DIR',str(tools.parent))
     assert dry('backend',root,'--native-tokens')['command']==cmd
     assert '--tool-call-parser' not in dry('frontend',root,'--native-tokens')['command']
@@ -112,3 +121,9 @@ def test_native_chat_parsers_reuse_shipped_template_and_respect_opt_out(tmp_path
     (tools/'bielik_vllm_tool_parser.py').unlink()
     with pytest.raises(ValueError,match='Missing bielik-tools file'):
         dry('backend',root,'--native-tokens')
+
+
+def test_native_missing_parser_checkout_fails_before_start(tmp_path,monkeypatch):
+    monkeypatch.delenv('BIELIK_TOOLS_DIR')
+    with pytest.raises(ValueError,match='parsers are required'):
+        dry('backend',original(tmp_path),'--native-tokens')

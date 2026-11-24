@@ -7,7 +7,8 @@
         --middleware bielik_one.api.vllm_middleware.SystemOneMiddleware
 
 `bielik-one backend $PKG --shell` prints the full validated command (the LoRA path is $PKG/adapter for Llama adapter
-packages and $PKG for Qwen ones); append the --middleware flag to it.
+packages and $PKG for Qwen ones); append the --middleware flag to it. Chat tool and reasoning parsers are
+required. Set BIELIK_TOOLS_DIR for Bielik adapter/native commands; Qwen adapters use built-in vLLM parsers.
 
 Everything a client sees uses vLLM's served model name of the base model (--served-model-name, by default the model
 argument); the middleware reads it from /v1/models on the first decision request, so nothing has to repeat it:
@@ -249,6 +250,7 @@ def build_engine(settings: Settings):
     # /v1/systemone answers to the served names only (not "decision" or the reference repo name); they are
     # read from vLLM when the middleware binds, so nothing is accepted before that.
     engine.aliases = set()
+    engine.chat_parser_profile = "qwen" if kind == "qwen-adapter" else "bielik"
     log.info(
         "SystemOne decisions at %s (adapter %r, %d workers, calibration: %s)",
         DECISION_PATH, settings.lora_name, settings.workers, source or "none",
@@ -548,6 +550,7 @@ class SystemOneMiddleware:
                 async with original_lifespan(app) as state:
                     if self.settings.mode == "native":
                         self._check_native_backend(app)
+                    self._check_chat_parsers(app)
                     yield state
             finally:
                 self.engine.close()
@@ -562,6 +565,26 @@ class SystemOneMiddleware:
                 f"SystemOne middleware: --api-server-count {count} needs SYSTEMONE_INTERNAL_TOKEN set to one secret "
                 "shared by every API process (loopback reads can reach any of them)"
             )
+    def _check_chat_parsers(self, app):
+        profile = "bielik" if self.settings.mode == "native" else getattr(self.engine, "chat_parser_profile", None)
+        args = getattr(app.state, "args", None)
+        config = getattr(app.state, "vllm_config", None)
+        structured = getattr(config, "structured_outputs_config", None)
+        if structured is None:
+            structured = getattr(args, "structured_outputs_config", None)
+        reasoning = getattr(structured, "reasoning_parser", None) if structured is not None else getattr(args, "reasoning_parser", None)
+        tool = "bielik" if profile == "bielik" else "qwen3_coder" if profile == "qwen" else None
+        expected_reasoning = "bielik" if profile == "bielik" else "qwen3" if profile == "qwen" else None
+        actual_tool = getattr(args, "tool_call_parser", None)
+        if (not getattr(args, "enable_auto_tool_choice", False) or not actual_tool or not reasoning
+                or (tool is not None and actual_tool != tool)
+                or (expected_reasoning is not None and reasoning != expected_reasoning)):
+            raise RuntimeError(
+                f"Chat tool and reasoning parsers are required: --enable-auto-tool-choice "
+                f"--tool-call-parser {tool or '<model-specific-parser>'} --reasoning-parser {expected_reasoning or '<model-specific-parser>'}. "
+                "Use the complete command printed by bielik-one backend --shell, including parser-plugin flags for Bielik."
+            )
+
     def _check_native_backend(self, app):
         args = getattr(app.state, "args", None)
         config = getattr(app.state, "vllm_config", None)
